@@ -1566,16 +1566,32 @@ export function generateCreateGroupController(params: {
     script += 'var cy = (union.minY + union.maxY) / 2;\n';
   }
 
+  // The null's in/out must cover every controlled layer, like a human
+  // would trim it: from the earliest inPoint to the latest outPoint.
+  script += 'var minIn = null, maxOut = null;\n';
+  script += 'for (var tp = 0; tp < layersToControl.length; tp++) {\n';
+  script += '  if (minIn === null || layersToControl[tp].inPoint < minIn) { minIn = layersToControl[tp].inPoint; }\n';
+  script += '  if (maxOut === null || layersToControl[tp].outPoint > maxOut) { maxOut = layersToControl[tp].outPoint; }\n';
+  script += '}\n';
+
   // Null anchor sits at its position in comp space, so putting the null at
   // the bbox center makes it the pivot: scaling it later resizes the whole
   // arrangement around the center, gaps included, proportionally.
   script += 'var ctrl = comp.layers.addNull(comp.duration);\n';
   script += 'ctrl.name = "' + escapeString(nullName) + '";\n';
-  script += 'ctrl.startTime = 0;\n';
-  script += 'if (ctrl.index !== 1) {\n';
-  script += '  ctrl.moveToBeginning();\n';
-  script += '}\n';
+  script += 'ctrl.startTime = minIn;\n';
+  script += 'ctrl.outPoint = maxOut;\n';
   script += 'ctrl.property("ADBE Transform Group").property("ADBE Position").setValue([cx, cy]);\n';
+
+  // Sit just above the topmost controlled layer, not at the top of the
+  // comp — overlays above the group must stay above the controller too.
+  script += 'var topMost = layersToControl[0];\n';
+  script += 'for (var ti = 1; ti < layersToControl.length; ti++) {\n';
+  script += '  if (layersToControl[ti].index < topMost.index) { topMost = layersToControl[ti]; }\n';
+  script += '}\n';
+  script += 'if (ctrl.index !== topMost.index - 1) {\n';
+  script += '  ctrl.moveBefore(topMost);\n';
+  script += '}\n';
 
   // A layer whose ancestor is also selected already follows the rig through
   // its parent; re-parenting it to the null would break the existing rig.
@@ -1625,6 +1641,8 @@ export function generateCreateGroupController(params: {
     nullName: 'ctrl.name',
     nullIndex: 'ctrl.index',
     position: '[Math.round(cx * 100) / 100, Math.round(cy * 100) / 100]',
+    inPoint: 'Math.round(ctrl.inPoint * 1000) / 1000',
+    outPoint: 'Math.round(ctrl.outPoint * 1000) / 1000',
     controlledLayers: 'controlled',
     childrenFollowingTheirParent: 'childrenSkipped',
     detachedFromPreviousParent: 'reparented'

@@ -531,7 +531,7 @@ const TOOLS = [
   },
   {
     name: 'create_group_controller',
-    description: 'Create a null layer that controls a set of layers as one rig: the null is placed at the center of their combined bounding box and every root layer is parented to it (visual positions are preserved — no jump). Afterwards, animate/modify the NULL\'s Scale to resize the whole arrangement (spacing scales proportionally), or its Position/Rotation to move/rotate everything together. Layers already parented to another selected layer keep their parent (the rig is preserved); layers parented to an outside layer are detached from it and reported in the result.',
+    description: 'Create a null layer that controls a set of layers as one rig: the null is placed at the center of their combined bounding box and every root layer is parented to it (visual positions are preserved — no jump). The null automatically spans the union of the controlled layers\' in/out points and sits in the stack just ABOVE the topmost controlled layer (overlays higher up stay above it). Afterwards, animate/modify the NULL\'s Scale to resize the whole arrangement (spacing scales proportionally), or its Position/Rotation to move/rotate everything together. Layers already parented to another selected layer keep their parent (the rig is preserved); layers parented to an outside layer are detached from it and reported in the result.',
     inputSchema: {
       type: 'object',
       properties: {
