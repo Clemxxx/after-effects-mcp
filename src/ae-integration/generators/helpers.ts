@@ -220,6 +220,10 @@ export function wrapInUndoGroup(script: string, name: string): string {
   wrapped += '  throw e;\n';
   wrapped += '}\n';
   wrapped += 'app.endUndoGroup();\n';
+  // eval() returns the last evaluated expression — re-emit the script's
+  // `result` object so it isn't clobbered by the endUndoGroup() call above
+  wrapped += 'var __aemcpFinal = (typeof result === "undefined") ? { success: true } : result;\n';
+  wrapped += '__aemcpFinal;\n';
   return wrapped;
 }
 

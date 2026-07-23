@@ -37,6 +37,15 @@ export function generateSetKeyframe(params: {
 
   script += 'var keyTime = ' + params.time + ';\n';
   script += 'var keyValue = ' + formatKeyframeValue(params.value) + ';\n';
+  if (typeof params.value === 'string') {
+    // Source Text: a raw string as key value would reset the layer's styling.
+    // Reuse the current TextDocument and only swap its text instead.
+    script += 'if (prop.propertyValueType === PropertyValueType.TEXT_DOCUMENT) {\n';
+    script += '  var __textDoc = prop.value;\n';
+    script += '  __textDoc.text = keyValue;\n';
+    script += '  keyValue = __textDoc;\n';
+    script += '}\n';
+  }
 
   // Check if property can have keyframes
   script += 'if (!prop.canVaryOverTime) {\n';
@@ -80,6 +89,15 @@ export function generateSetKeyframeAdvanced(params: {
 
   script += 'var keyTime = ' + params.time + ';\n';
   script += 'var keyValue = ' + formatKeyframeValue(params.value) + ';\n';
+  if (typeof params.value === 'string') {
+    // Source Text: a raw string as key value would reset the layer's styling.
+    // Reuse the current TextDocument and only swap its text instead.
+    script += 'if (prop.propertyValueType === PropertyValueType.TEXT_DOCUMENT) {\n';
+    script += '  var __textDoc = prop.value;\n';
+    script += '  __textDoc.text = keyValue;\n';
+    script += '  keyValue = __textDoc;\n';
+    script += '}\n';
+  }
 
   script += 'if (!prop.canVaryOverTime) {\n';
   script += '  throw new Error("Property cannot have keyframes: ' + escapeString(params.property) + '");\n';
@@ -134,6 +152,112 @@ export function generateSetKeyframeAdvanced(params: {
   });
 
   return wrapInUndoGroup(script, 'Set Keyframe');
+}
+
+/**
+ * Generate script to set many keyframes on one property in a single call.
+ * The comp/layer/property lookup happens once, then all keys are added in
+ * one loop — much faster than one set_keyframe per key.
+ */
+export function generateSetKeyframes(params: {
+  compId?: number;
+  compName?: string;
+  layerIndex?: number;
+  layerName?: string;
+  property: string;
+  keyframes: Array<{
+    time: number;
+    value: number | number[] | string;
+    inType?: string;
+    outType?: string;
+    inEase?: { speed: number; influence: number };
+    outEase?: { speed: number; influence: number };
+  }>;
+}): string {
+  if (!params.keyframes || !Array.isArray(params.keyframes) || params.keyframes.length === 0) {
+    throw new Error('keyframes must be a non-empty array of { time, value }');
+  }
+
+  let hasStringValue = false;
+  const entries: string[] = [];
+  for (let i = 0; i < params.keyframes.length; i++) {
+    const kf = params.keyframes[i];
+    if (!kf || typeof kf.time !== 'number' || kf.value === undefined || kf.value === null) {
+      throw new Error('keyframes[' + i + '] must have a numeric time and a value');
+    }
+    if (typeof kf.value === 'string') {
+      hasStringValue = true;
+    }
+    let entry = '{ t: ' + kf.time + ', v: ' + formatKeyframeValue(kf.value);
+    if (kf.inType || kf.outType) {
+      entry += ', it: ' + generateInterpolationType(kf.inType || 'BEZIER');
+      entry += ', ot: ' + generateInterpolationType(kf.outType || 'BEZIER');
+    }
+    if (kf.inEase) {
+      entry += ', ie: { s: ' + kf.inEase.speed + ', i: ' + kf.inEase.influence + ' }';
+    }
+    if (kf.outEase) {
+      entry += ', oe: { s: ' + kf.outEase.speed + ', i: ' + kf.outEase.influence + ' }';
+    }
+    entry += ' }';
+    entries.push(entry);
+  }
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+  script += generateLayerAccess('comp', params.layerIndex, params.layerName);
+  script += generatePropertyAccess('layer', params.property);
+
+  script += 'if (!prop.canVaryOverTime) {\n';
+  script += '  throw new Error("Property cannot have keyframes: ' + escapeString(params.property) + '");\n';
+  script += '}\n';
+
+  script += 'var __keys = [\n';
+  script += '  ' + entries.join(',\n  ') + '\n';
+  script += '];\n';
+
+  script += 'var numDims = 1;\n';
+  script += 'if (prop.propertyValueType === PropertyValueType.TwoD || prop.propertyValueType === PropertyValueType.TwoD_SPATIAL) {\n';
+  script += '  numDims = 2;\n';
+  script += '} else if (prop.propertyValueType === PropertyValueType.ThreeD || prop.propertyValueType === PropertyValueType.ThreeD_SPATIAL) {\n';
+  script += '  numDims = 3;\n';
+  script += '}\n';
+
+  script += 'for (var k = 0; k < __keys.length; k++) {\n';
+  script += '  var kd = __keys[k];\n';
+  script += '  var kv = kd.v;\n';
+  if (hasStringValue) {
+    // Source Text: a raw string as key value would reset the layer's styling.
+    // Reuse the current TextDocument and only swap its text instead.
+    script += '  if (typeof kv === "string" && prop.propertyValueType === PropertyValueType.TEXT_DOCUMENT) {\n';
+    script += '    var __textDoc = prop.value;\n';
+    script += '    __textDoc.text = kv;\n';
+    script += '    kv = __textDoc;\n';
+    script += '  }\n';
+  }
+  script += '  var ki = prop.addKey(kd.t);\n';
+  script += '  prop.setValueAtKey(ki, kv);\n';
+  script += '  if (kd.it) {\n';
+  script += '    prop.setInterpolationTypeAtKey(ki, kd.it, kd.ot);\n';
+  script += '  }\n';
+  script += '  if (kd.ie || kd.oe) {\n';
+  script += '    var inEaseArr = [];\n';
+  script += '    var outEaseArr = [];\n';
+  script += '    for (var d = 0; d < numDims; d++) {\n';
+  script += '      inEaseArr.push(kd.ie ? new KeyframeEase(kd.ie.s, kd.ie.i) : new KeyframeEase(0, 33.33));\n';
+  script += '      outEaseArr.push(kd.oe ? new KeyframeEase(kd.oe.s, kd.oe.i) : new KeyframeEase(0, 33.33));\n';
+  script += '    }\n';
+  script += '    prop.setTemporalEaseAtKey(ki, inEaseArr, outEaseArr);\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += generateResultObject({
+    property: '"' + escapeString(params.property) + '"',
+    keysSet: '__keys.length'
+  });
+
+  return wrapInUndoGroup(script, 'Set Keyframes');
 }
 
 /**

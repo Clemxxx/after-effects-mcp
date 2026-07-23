@@ -230,6 +230,48 @@ export function generateGetCompositionInfo(params: {
 }
 
 /**
+ * Generate script to render a single frame of a composition to a PNG file
+ */
+export function generateGetCompositionFrame(params: {
+  compId?: number;
+  compName?: string;
+  time?: number;
+  outputPath: string;
+}): string {
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+
+  script += 'if (typeof comp.saveFrameToPng !== "function") {\n';
+  script += '  throw new Error("saveFrameToPng is not available in this version of After Effects (requires 22.0+)");\n';
+  script += '}\n';
+
+  if (params.time !== undefined) {
+    script += 'var frameTime = ' + params.time + ';\n';
+  } else {
+    script += 'var frameTime = comp.time;\n';
+  }
+  script += 'if (frameTime < 0) { frameTime = 0; }\n';
+  script += 'var lastFrameTime = comp.duration - comp.frameDuration;\n';
+  script += 'if (frameTime > lastFrameTime) { frameTime = lastFrameTime; }\n';
+
+  // saveFrameToPng is asynchronous: it returns before the PNG is written.
+  // The Node server waits for the file to appear, so do not check outFile.exists here.
+  script += 'var outFile = new File("' + escapeString(params.outputPath) + '");\n';
+  script += 'comp.saveFrameToPng(frameTime, outFile);\n';
+
+  script += generateResultObject({
+    path: 'outFile.fsName',
+    compName: 'comp.name',
+    time: 'frameTime',
+    width: 'comp.width',
+    height: 'comp.height'
+  });
+
+  return script;
+}
+
+/**
  * Generate script to set active composition
  */
 export function generateSetActiveComposition(params: {

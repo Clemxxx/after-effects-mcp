@@ -6,6 +6,7 @@
 
 import {
   escapeString,
+  arrayToES3,
   generateProjectCheck,
   generateCompAccess,
   wrapInUndoGroup,
@@ -57,12 +58,12 @@ export function generateImportFolder(params: {
   script += 'var rootFolder = app.project.items.addFolder(folder.name);\n';
   script += 'importFilesFromFolder(folder, rootFolder);\n';
 
-  script += '{\n';
-  script += '  folderId: rootFolder.id,\n';
-  script += '  folderName: rootFolder.name,\n';
-  script += '  importedCount: importedItems.length,\n';
-  script += '  items: importedItems\n';
-  script += '};\n';
+  script += generateResultObject({
+    folderId: 'rootFolder.id',
+    folderName: 'rootFolder.name',
+    importedCount: 'importedItems.length',
+    items: 'importedItems'
+  });
 
   return wrapInUndoGroup(script, 'Import Folder');
 }
@@ -197,6 +198,117 @@ export function generateOrganizeProjectItems(params: {
 }
 
 /**
+ * Generate script to move project items into a (possibly nested) folder,
+ * creating the folder path if it does not exist.
+ */
+export function generateMoveProjectItems(params: {
+  folderPath: string;
+  itemNames?: string[];
+  itemIds?: number[];
+}): string {
+  const pathParts = params.folderPath
+    .split('/')
+    .map(function (p) { return p.trim(); })
+    .filter(function (p) { return p.length > 0; });
+
+  if (pathParts.length === 0) {
+    throw new Error('folderPath must contain at least one folder name');
+  }
+
+  let script = '';
+  script += generateProjectCheck();
+
+  // Walk the folder path from the root, creating missing folders
+  script += 'var pathParts = ' + arrayToES3(pathParts) + ';\n';
+  script += 'var currentFolder = app.project.rootFolder;\n';
+  script += 'for (var p = 0; p < pathParts.length; p++) {\n';
+  script += '  var found = null;\n';
+  script += '  for (var c = 1; c <= currentFolder.numItems; c++) {\n';
+  script += '    var child = currentFolder.item(c);\n';
+  script += '    if (child instanceof FolderItem && child.name === pathParts[p]) {\n';
+  script += '      found = child;\n';
+  script += '      break;\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  if (!found) {\n';
+  script += '    found = app.project.items.addFolder(pathParts[p]);\n';
+  script += '    found.parentFolder = currentFolder;\n';
+  script += '  }\n';
+  script += '  currentFolder = found;\n';
+  script += '}\n';
+  script += 'var targetFolder = currentFolder;\n';
+
+  // Collect items first, then move — moving while iterating reorders indices
+  script += 'var itemsToMove = [];\n';
+  script += 'var notFound = [];\n';
+
+  if (params.itemIds && params.itemIds.length > 0) {
+    script += 'var ids = ' + arrayToES3(params.itemIds) + ';\n';
+    script += 'for (var d = 0; d < ids.length; d++) {\n';
+    script += '  var byId = app.project.itemByID(ids[d]);\n';
+    script += '  if (byId) {\n';
+    script += '    itemsToMove.push(byId);\n';
+    script += '  } else {\n';
+    script += '    notFound.push("id:" + ids[d]);\n';
+    script += '  }\n';
+    script += '}\n';
+  }
+
+  if (params.itemNames && params.itemNames.length > 0) {
+    script += 'var names = ' + arrayToES3(params.itemNames) + ';\n';
+    script += 'for (var n = 0; n < names.length; n++) {\n';
+    script += '  var matched = false;\n';
+    script += '  for (var i = 1; i <= app.project.numItems; i++) {\n';
+    script += '    if (app.project.item(i).name === names[n]) {\n';
+    script += '      itemsToMove.push(app.project.item(i));\n';
+    script += '      matched = true;\n';
+    script += '    }\n';
+    script += '  }\n';
+    script += '  if (!matched) {\n';
+    script += '    notFound.push(names[n]);\n';
+    script += '  }\n';
+    script += '}\n';
+  }
+
+  script += 'var movedItems = [];\n';
+  script += 'var skipped = [];\n';
+  script += 'for (var m = 0; m < itemsToMove.length; m++) {\n';
+  script += '  var moveItem = itemsToMove[m];\n';
+  // A folder cannot be moved into itself or one of its descendants
+  script += '  var invalid = false;\n';
+  script += '  if (moveItem instanceof FolderItem) {\n';
+  script += '    var anc = targetFolder;\n';
+  script += '    while (anc) {\n';
+  script += '      if (anc === moveItem) {\n';
+  script += '        invalid = true;\n';
+  script += '        break;\n';
+  script += '      }\n';
+  script += '      if (anc === app.project.rootFolder) break;\n';
+  script += '      anc = anc.parentFolder;\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  if (invalid) {\n';
+  script += '    skipped.push(moveItem.name);\n';
+  script += '  } else {\n';
+  script += '    moveItem.parentFolder = targetFolder;\n';
+  script += '    movedItems.push(moveItem.name);\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += generateResultObject({
+    success: 'true',
+    folderPath: '"' + escapeString(params.folderPath) + '"',
+    folderId: 'targetFolder.id',
+    movedCount: 'movedItems.length',
+    movedItems: 'movedItems',
+    notFound: 'notFound',
+    skipped: 'skipped'
+  });
+
+  return wrapInUndoGroup(script, 'Move Project Items');
+}
+
+/**
  * Generate script to find missing footage
  */
 export function generateFindMissingFootage(): string {
@@ -271,11 +383,11 @@ export function generateCollectFiles(params: {
   script += 'var projectFile = new File(outputFolder.fsName + "/" + (app.project.file ? app.project.file.name : "collected_project.aep"));\n';
   script += 'app.project.save(projectFile);\n';
 
-  script += '{\n';
-  script += '  outputPath: outputFolder.fsName,\n';
-  script += '  collectedCount: collectedFiles.length,\n';
-  script += '  files: collectedFiles\n';
-  script += '};\n';
+  script += generateResultObject({
+    outputPath: 'outputFolder.fsName',
+    collectedCount: 'collectedFiles.length',
+    files: 'collectedFiles'
+  });
 
   return wrapInUndoGroup(script, 'Collect Files');
 }

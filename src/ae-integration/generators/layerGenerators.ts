@@ -110,8 +110,16 @@ export function generateAddTextLayer(params: {
 
   script += 'textProp.setValue(textDoc);\n';
 
+  // addText() drops the layer wherever AE decides, anchored on the text
+  // baseline — unlike layers.add(sourceItem) which AE auto-centers. Center
+  // the anchor on the text's real bounding box so `position` means "center
+  // of the text block", and default that position to the comp center.
+  script += 'var __r = layer.sourceRectAtTime(comp.time, false);\n';
+  script += 'layer.property("Anchor Point").setValue([__r.left + __r.width / 2, __r.top + __r.height / 2]);\n';
   if (params.position) {
     script += 'layer.property("Position").setValue(' + positionToES3(params.position) + ');\n';
+  } else {
+    script += 'layer.property("Position").setValue([comp.width / 2, comp.height / 2]);\n';
   }
 
   script += generateResultObject({
@@ -190,8 +198,14 @@ export function generateAddTextLayerAdvanced(params: {
 
   script += 'textProp.setValue(textDoc);\n';
 
+  // Same centering as generateAddTextLayer: anchor on the text's bounding
+  // box, position defaulting to the comp center (see comment there).
+  script += 'var __r = layer.sourceRectAtTime(comp.time, false);\n';
+  script += 'layer.property("Anchor Point").setValue([__r.left + __r.width / 2, __r.top + __r.height / 2]);\n';
   if (params.position) {
     script += 'layer.property("Position").setValue(' + positionToES3(params.position) + ');\n';
+  } else {
+    script += 'layer.property("Position").setValue([comp.width / 2, comp.height / 2]);\n';
   }
 
   script += generateResultObject({
@@ -457,6 +471,13 @@ export function generateAddAVLayer(params: {
 
   script += 'var layer = comp.layers.add(sourceItem);\n';
 
+  // addText()/addSolid() always land at index 1, but layers.add() gives no
+  // such guarantee — force the top of the stack so every creation tool
+  // behaves the same (use reorder_layer to move the layer afterwards).
+  script += 'if (layer.index !== 1) {\n';
+  script += '  layer.moveToBeginning();\n';
+  script += '}\n';
+
   if (params.startTime !== undefined) {
     script += 'layer.startTime = ' + params.startTime + ';\n';
   }
@@ -616,12 +637,772 @@ export function generateDeleteLayer(params: {
   return wrapInUndoGroup(script, 'Delete Layer');
 }
 
+const CHARACTER_RANGE_GUARD =
+  'if (typeof textDoc.characterRange !== "function") {\n' +
+  '  throw new Error("Per-character text styling requires After Effects 24.3+ (characterRange API not available in this version)");\n' +
+  '}\n';
+
+/**
+ * Generate script to read per-character style runs of a text layer.
+ * Requires AE 24.3+ (TextDocument.characterRange API).
+ */
+export function generateGetTextStyles(params: {
+  compId?: number;
+  compName?: string;
+  layerIndex?: number;
+  layerName?: string;
+}): string {
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+  script += generateLayerAccess('comp', params.layerIndex, params.layerName);
+
+  script += 'if (!(layer instanceof TextLayer)) {\n';
+  script += '  throw new Error("Layer is not a text layer: " + layer.name);\n';
+  script += '}\n';
+  script += 'var textDoc = layer.property("Source Text").value;\n';
+  script += CHARACTER_RANGE_GUARD;
+  script += 'var fullText = textDoc.text;\n';
+
+  // Read each character's style and group consecutive identical ones into runs
+  script += 'var runs = [];\n';
+  script += 'var prevKey = null;\n';
+  script += 'for (var ci = 0; ci < fullText.length; ci++) {\n';
+  script += '  var cr = textDoc.characterRange(ci, ci + 1);\n';
+  script += '  var st = {};\n';
+  script += '  try { st.font = cr.font; } catch (e1) {}\n';
+  script += '  try {\n';
+  script += '    if (cr.fontObject) {\n';
+  script += '      st.fontFamily = cr.fontObject.familyName;\n';
+  script += '      st.fontStyle = cr.fontObject.styleName;\n';
+  script += '    }\n';
+  script += '  } catch (e2) {}\n';
+  script += '  try { st.fontSize = cr.fontSize; } catch (e3) {}\n';
+  script += '  try {\n';
+  script += '    if (cr.applyFill) {\n';
+  script += '      st.fillColor = [cr.fillColor[0], cr.fillColor[1], cr.fillColor[2]];\n';
+  script += '    }\n';
+  script += '  } catch (e4) {}\n';
+  script += '  try {\n';
+  script += '    if (cr.applyStroke) {\n';
+  script += '      st.strokeColor = [cr.strokeColor[0], cr.strokeColor[1], cr.strokeColor[2]];\n';
+  script += '      st.strokeWidth = cr.strokeWidth;\n';
+  script += '    }\n';
+  script += '  } catch (e5) {}\n';
+  script += '  try { st.fauxBold = cr.fauxBold; } catch (e6) {}\n';
+  script += '  try { st.fauxItalic = cr.fauxItalic; } catch (e7) {}\n';
+  script += '  try { st.tracking = cr.tracking; } catch (e8) {}\n';
+  script += '  var key = "";\n';
+  script += '  for (var k in st) {\n';
+  script += '    if (st.hasOwnProperty(k)) key += k + "=" + st[k] + ";";\n';
+  script += '  }\n';
+  script += '  if (prevKey !== null && key === prevKey) {\n';
+  script += '    var lastRun = runs[runs.length - 1];\n';
+  script += '    lastRun.end = ci + 1;\n';
+  script += '    lastRun.text += fullText.charAt(ci);\n';
+  script += '  } else {\n';
+  script += '    var newRun = { start: ci, end: ci + 1, text: fullText.charAt(ci) };\n';
+  script += '    for (var k2 in st) {\n';
+  script += '      if (st.hasOwnProperty(k2)) newRun[k2] = st[k2];\n';
+  script += '    }\n';
+  script += '    runs.push(newRun);\n';
+  script += '  }\n';
+  script += '  prevKey = key;\n';
+  script += '}\n';
+
+  script += generateResultObject({
+    layerName: 'layer.name',
+    text: 'fullText',
+    isMixed: 'runs.length > 1',
+    runCount: 'runs.length',
+    runs: 'runs'
+  });
+
+  return script;
+}
+
+/**
+ * Generate script to replace the text content of an existing text layer.
+ * Text animators, keyframes, expressions and layer styling are untouched —
+ * they live on the layer, not in the TextDocument.
+ */
+export function generateSetTextContent(params: {
+  compId?: number;
+  compName?: string;
+  layerIndex?: number;
+  layerName?: string;
+  text: string;
+}): string {
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+  script += generateLayerAccess('comp', params.layerIndex, params.layerName);
+
+  script += 'if (!(layer instanceof TextLayer)) {\n';
+  script += '  throw new Error("Layer is not a text layer: " + layer.name);\n';
+  script += '}\n';
+  script += 'var textProp = layer.property("Source Text");\n';
+  script += 'var textDoc = textProp.value;\n';
+  script += 'var previousText = textDoc.text;\n';
+  script += 'textDoc.text = "' + escapeString(params.text) + '";\n';
+  script += 'textProp.setValue(textDoc);\n';
+
+  script += generateResultObject({
+    success: 'true',
+    layerName: 'layer.name',
+    previousText: 'previousText',
+    text: '"' + escapeString(params.text) + '"'
+  });
+
+  return wrapInUndoGroup(script, 'Set Text Content');
+}
+
+/**
+ * Generate script to style a character range inside a text layer.
+ * Requires AE 24.3+ (TextDocument.characterRange API).
+ */
+export function generateSetTextStyleRange(params: {
+  compId?: number;
+  compName?: string;
+  layerIndex?: number;
+  layerName?: string;
+  startIndex?: number;
+  endIndex?: number;
+  matchText?: string;
+  font?: string;
+  fontFamily?: string;
+  fontStyle?: string;
+  fontSize?: number;
+  fillColor?: { r: number; g: number; b: number };
+  fauxBold?: boolean;
+  fauxItalic?: boolean;
+  tracking?: number;
+}): string {
+  const hasIndexRange = params.startIndex !== undefined && params.endIndex !== undefined;
+  if (!hasIndexRange && params.matchText === undefined) {
+    throw new Error('Provide either matchText or startIndex + endIndex to select the character range');
+  }
+  const hasStyle = params.font !== undefined || params.fontFamily !== undefined ||
+    params.fontSize !== undefined || params.fillColor !== undefined ||
+    params.fauxBold !== undefined || params.fauxItalic !== undefined ||
+    params.tracking !== undefined;
+  if (!hasStyle) {
+    throw new Error('Provide at least one style property (font, fontFamily/fontStyle, fontSize, fillColor, fauxBold, fauxItalic, tracking)');
+  }
+  if (params.fontFamily !== undefined && params.fontStyle === undefined) {
+    throw new Error('fontFamily requires fontStyle (e.g. "Bold Italic"); alternatively use font with a PostScript name');
+  }
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+  script += generateLayerAccess('comp', params.layerIndex, params.layerName);
+
+  script += 'if (!(layer instanceof TextLayer)) {\n';
+  script += '  throw new Error("Layer is not a text layer: " + layer.name);\n';
+  script += '}\n';
+  script += 'var textProp = layer.property("Source Text");\n';
+  script += 'var textDoc = textProp.value;\n';
+  script += CHARACTER_RANGE_GUARD;
+  script += 'var fullText = textDoc.text;\n';
+
+  if (params.matchText !== undefined) {
+    script += 'var startIdx = fullText.indexOf("' + escapeString(params.matchText) + '");\n';
+    script += 'if (startIdx === -1) {\n';
+    script += '  throw new Error("Text not found in layer: ' + escapeString(params.matchText) + '");\n';
+    script += '}\n';
+    script += 'var endIdx = startIdx + ' + params.matchText.length + ';\n';
+  } else {
+    script += 'var startIdx = ' + params.startIndex + ';\n';
+    script += 'var endIdx = ' + params.endIndex + ';\n';
+  }
+  script += 'if (startIdx < 0 || endIdx > fullText.length || startIdx >= endIdx) {\n';
+  script += '  throw new Error("Invalid character range " + startIdx + "-" + endIdx + " (text length: " + fullText.length + ")");\n';
+  script += '}\n';
+
+  script += 'var cr = textDoc.characterRange(startIdx, endIdx);\n';
+
+  if (params.fontFamily !== undefined) {
+    script += 'var matchedFonts = app.fonts.getFontsByFamilyNameAndStyleName("' +
+      escapeString(params.fontFamily) + '", "' + escapeString(params.fontStyle as string) + '");\n';
+    script += 'if (!matchedFonts || matchedFonts.length === 0) {\n';
+    script += '  throw new Error("Font not installed: ' + escapeString(params.fontFamily) + ' ' + escapeString(params.fontStyle as string) + '");\n';
+    script += '}\n';
+    script += 'cr.fontObject = matchedFonts[0];\n';
+  } else if (params.font !== undefined) {
+    script += 'cr.font = "' + escapeString(params.font) + '";\n';
+  }
+  if (params.fontSize !== undefined) {
+    script += 'cr.fontSize = ' + params.fontSize + ';\n';
+  }
+  if (params.fillColor !== undefined) {
+    script += 'cr.applyFill = true;\n';
+    script += 'cr.fillColor = ' + colorToES3(params.fillColor) + ';\n';
+  }
+  if (params.fauxBold !== undefined) {
+    script += 'cr.fauxBold = ' + params.fauxBold + ';\n';
+  }
+  if (params.fauxItalic !== undefined) {
+    script += 'cr.fauxItalic = ' + params.fauxItalic + ';\n';
+  }
+  if (params.tracking !== undefined) {
+    script += 'cr.tracking = ' + params.tracking + ';\n';
+  }
+
+  // Write the styled document back; since AE 24.3 setValue preserves
+  // per-character styling instead of flattening it
+  script += 'textProp.setValue(textDoc);\n';
+
+  script += generateResultObject({
+    success: 'true',
+    layerName: 'layer.name',
+    start: 'startIdx',
+    end: 'endIdx',
+    styledText: 'fullText.substring(startIdx, endIdx)'
+  });
+
+  return wrapInUndoGroup(script, 'Set Text Style Range');
+}
+
+/**
+ * Generate script to reorder a layer in the stacking order.
+ */
+export function generateReorderLayer(params: {
+  compId?: number;
+  compName?: string;
+  layerIndex?: number;
+  layerName?: string;
+  position: string;
+  targetIndex?: number;
+  referenceLayerIndex?: number;
+  referenceLayerName?: string;
+}): string {
+  const needsReference = params.position === 'before' || params.position === 'after';
+  if (needsReference &&
+      params.referenceLayerIndex === undefined && params.referenceLayerName === undefined) {
+    throw new Error('position "' + params.position + '" requires referenceLayerIndex or referenceLayerName');
+  }
+  if (params.position === 'index' && params.targetIndex === undefined) {
+    throw new Error('position "index" requires targetIndex');
+  }
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+
+  script += generateLayerAccess('comp', params.layerIndex, params.layerName);
+  script += 'var moveLayer = layer;\n';
+
+  if (needsReference) {
+    script += generateLayerAccess('comp', params.referenceLayerIndex, params.referenceLayerName);
+    script += 'var refLayer = layer;\n';
+    script += 'if (refLayer === moveLayer) {\n';
+    script += '  throw new Error("Reference layer and layer to move are the same");\n';
+    script += '}\n';
+  }
+
+  if (params.position === 'top') {
+    script += 'moveLayer.moveToBeginning();\n';
+  } else if (params.position === 'bottom') {
+    script += 'moveLayer.moveToEnd();\n';
+  } else if (params.position === 'before') {
+    script += 'moveLayer.moveBefore(refLayer);\n';
+  } else if (params.position === 'after') {
+    script += 'moveLayer.moveAfter(refLayer);\n';
+  } else if (params.position === 'index') {
+    script += 'var t = ' + params.targetIndex + ';\n';
+    script += 'if (t <= 1) {\n';
+    script += '  moveLayer.moveToBeginning();\n';
+    script += '} else if (t >= comp.numLayers) {\n';
+    script += '  moveLayer.moveToEnd();\n';
+    script += '} else if (moveLayer.index < t) {\n';
+    script += '  moveLayer.moveAfter(comp.layer(t));\n';
+    script += '} else if (moveLayer.index > t) {\n';
+    script += '  moveLayer.moveBefore(comp.layer(t));\n';
+    script += '}\n';
+  } else {
+    throw new Error('Unknown position: ' + params.position);
+  }
+
+  script += generateResultObject({
+    success: 'true',
+    layerName: 'moveLayer.name',
+    newIndex: 'moveLayer.index'
+  });
+
+  return wrapInUndoGroup(script, 'Reorder Layer');
+}
+
+/**
+ * Generate script to align layers to the composition canvas.
+ * Default mode treats the whole selection as ONE group: the combined
+ * bounding box is aligned and every layer moves by the same delta, so the
+ * relative layout inside the group is preserved. Bounds account for anchor
+ * point, scale, Z rotation and parent chains; position keyframes are
+ * offset along with the layer so animations move too.
+ */
+export function generateAlignLayers(params: {
+  compId?: number;
+  compName?: string;
+  layerIndices?: number[];
+  layerNames?: string[];
+  horizontal?: string;
+  vertical?: string;
+  mode?: string;
+  padding?: number;
+  time?: number;
+}): string {
+  const horizontal = params.horizontal;
+  const vertical = params.vertical;
+  if (!horizontal && !vertical) {
+    throw new Error('align_layers needs at least one of horizontal ("left"|"center"|"right") or vertical ("top"|"middle"|"bottom")');
+  }
+  if (horizontal && ['left', 'center', 'right'].indexOf(horizontal) === -1) {
+    throw new Error('horizontal must be "left", "center" or "right"');
+  }
+  if (vertical && ['top', 'middle', 'bottom'].indexOf(vertical) === -1) {
+    throw new Error('vertical must be "top", "middle" or "bottom"');
+  }
+  const mode = params.mode || 'group';
+  if (mode !== 'group' && mode !== 'individual') {
+    throw new Error('mode must be "group" or "individual"');
+  }
+  const padding = params.padding || 0;
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+
+  script += 'var layersToAlign = [];\n';
+  script += 'var notFound = [];\n';
+
+  if (params.layerIndices && params.layerIndices.length > 0) {
+    script += 'var idxs = ' + arrayToES3(params.layerIndices) + ';\n';
+    script += 'for (var d = 0; d < idxs.length; d++) {\n';
+    script += '  if (idxs[d] >= 1 && idxs[d] <= comp.numLayers) {\n';
+    script += '    layersToAlign.push(comp.layer(idxs[d]));\n';
+    script += '  } else {\n';
+    script += '    notFound.push("index:" + idxs[d]);\n';
+    script += '  }\n';
+    script += '}\n';
+  }
+
+  if (params.layerNames && params.layerNames.length > 0) {
+    script += 'var names = ' + arrayToES3(params.layerNames) + ';\n';
+    script += 'for (var n = 0; n < names.length; n++) {\n';
+    script += '  var matched = false;\n';
+    script += '  for (var i = 1; i <= comp.numLayers; i++) {\n';
+    script += '    if (comp.layer(i).name === names[n]) {\n';
+    script += '      layersToAlign.push(comp.layer(i));\n';
+    script += '      matched = true;\n';
+    script += '    }\n';
+    script += '  }\n';
+    script += '  if (!matched) {\n';
+    script += '    notFound.push(names[n]);\n';
+    script += '  }\n';
+    script += '}\n';
+  }
+
+  script += 'if (notFound.length > 0) {\n';
+  script += '  throw new Error("align_layers: layers not found: " + notFound.join(", "));\n';
+  script += '}\n';
+  script += 'if (layersToAlign.length === 0) {\n';
+  script += '  throw new Error("align_layers: no layers to align (pass layerNames or layerIndices)");\n';
+  script += '}\n';
+  script += 'for (var cl = 0; cl < layersToAlign.length; cl++) {\n';
+  script += '  if (layersToAlign[cl] instanceof CameraLayer || layersToAlign[cl] instanceof LightLayer) {\n';
+  script += '    throw new Error("align_layers: layer " + layersToAlign[cl].name + " is a camera/light and has no bounds to align");\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += 'var alignTime = ' + (params.time !== undefined ? params.time : 'comp.time') + ';\n';
+
+  // Layer-to-comp geometry: walk the parent chain applying anchor/scale/
+  // Z-rotation/position at each level (2D math; 3D X/Y rotations ignored).
+  script += 'var __d2r = Math.PI / 180;\n';
+  script += 'var __xf = function (lyr) {\n';
+  script += '  var tr = lyr.property("ADBE Transform Group");\n';
+  script += '  var a = tr.property("ADBE Anchor Point").valueAtTime(alignTime, false);\n';
+  script += '  var p = tr.property("ADBE Position").valueAtTime(alignTime, false);\n';
+  script += '  var s = tr.property("ADBE Scale").valueAtTime(alignTime, false);\n';
+  script += '  var rp = tr.property("ADBE Rotate Z");\n';
+  script += '  var r = rp ? rp.valueAtTime(alignTime, false) * __d2r : 0;\n';
+  script += '  return { ax: a[0], ay: a[1], px: p[0], py: p[1], sx: s[0] / 100, sy: s[1] / 100, r: r };\n';
+  script += '};\n';
+  script += 'var __toComp = function (lyr, x, y) {\n';
+  script += '  var cur = lyr;\n';
+  script += '  var px = x, py = y;\n';
+  script += '  while (cur) {\n';
+  script += '    var f = __xf(cur);\n';
+  script += '    var lx = (px - f.ax) * f.sx;\n';
+  script += '    var ly = (py - f.ay) * f.sy;\n';
+  script += '    var c = Math.cos(f.r), sn = Math.sin(f.r);\n';
+  script += '    px = f.px + lx * c - ly * sn;\n';
+  script += '    py = f.py + lx * sn + ly * c;\n';
+  script += '    cur = cur.parent;\n';
+  script += '  }\n';
+  script += '  return [px, py];\n';
+  script += '};\n';
+  // Inverse of the parent chain's linear part, to convert a comp-space
+  // delta into the layer's own position space (position lives in parent space).
+  script += 'var __compDeltaToParent = function (lyr, dx, dy) {\n';
+  script += '  var m00 = 1, m01 = 0, m10 = 0, m11 = 1;\n';
+  script += '  var cur = lyr.parent;\n';
+  script += '  while (cur) {\n';
+  script += '    var f = __xf(cur);\n';
+  script += '    var c = Math.cos(f.r), sn = Math.sin(f.r);\n';
+  script += '    var a00 = c * f.sx, a01 = -sn * f.sy;\n';
+  script += '    var a10 = sn * f.sx, a11 = c * f.sy;\n';
+  script += '    var n00 = a00 * m00 + a01 * m10;\n';
+  script += '    var n01 = a00 * m01 + a01 * m11;\n';
+  script += '    var n10 = a10 * m00 + a11 * m10;\n';
+  script += '    var n11 = a10 * m01 + a11 * m11;\n';
+  script += '    m00 = n00; m01 = n01; m10 = n10; m11 = n11;\n';
+  script += '    cur = cur.parent;\n';
+  script += '  }\n';
+  script += '  var det = m00 * m11 - m01 * m10;\n';
+  script += '  if (det > -1e-9 && det < 1e-9) {\n';
+  script += '    throw new Error("align_layers: layer " + lyr.name + " has a parent scaled to 0, cannot compute its move");\n';
+  script += '  }\n';
+  script += '  return [(m11 * dx - m01 * dy) / det, (m00 * dy - m10 * dx) / det];\n';
+  script += '};\n';
+  script += 'var __bounds = function (lyr) {\n';
+  script += '  var rect = null;\n';
+  script += '  try { rect = lyr.sourceRectAtTime(alignTime, false); } catch (eR) {}\n';
+  script += '  if (!rect && lyr.source) {\n';
+  script += '    rect = { left: 0, top: 0, width: lyr.source.width, height: lyr.source.height };\n';
+  script += '  }\n';
+  script += '  if (!rect) {\n';
+  script += '    throw new Error("align_layers: cannot measure the bounds of layer " + lyr.name);\n';
+  script += '  }\n';
+  script += '  var corners = [[rect.left, rect.top], [rect.left + rect.width, rect.top], [rect.left, rect.top + rect.height], [rect.left + rect.width, rect.top + rect.height]];\n';
+  script += '  var b = null;\n';
+  script += '  for (var cI = 0; cI < 4; cI++) {\n';
+  script += '    var pt = __toComp(lyr, corners[cI][0], corners[cI][1]);\n';
+  script += '    if (!b) {\n';
+  script += '      b = { minX: pt[0], minY: pt[1], maxX: pt[0], maxY: pt[1] };\n';
+  script += '    } else {\n';
+  script += '      if (pt[0] < b.minX) b.minX = pt[0];\n';
+  script += '      if (pt[1] < b.minY) b.minY = pt[1];\n';
+  script += '      if (pt[0] > b.maxX) b.maxX = pt[0];\n';
+  script += '      if (pt[1] > b.maxY) b.maxY = pt[1];\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  return b;\n';
+  script += '};\n';
+  script += 'var __unionBounds = function (a, b) {\n';
+  script += '  if (!a) return b;\n';
+  script += '  if (b.minX < a.minX) a.minX = b.minX;\n';
+  script += '  if (b.minY < a.minY) a.minY = b.minY;\n';
+  script += '  if (b.maxX > a.maxX) a.maxX = b.maxX;\n';
+  script += '  if (b.maxY > a.maxY) a.maxY = b.maxY;\n';
+  script += '  return a;\n';
+  script += '};\n';
+
+  // The comp-space delta that aligns a bounding box to the canvas.
+  script += 'var __pad = ' + padding + ';\n';
+  script += 'var __deltaFor = function (b) {\n';
+  script += '  var dx = 0, dy = 0;\n';
+  if (horizontal === 'left') {
+    script += '  dx = __pad - b.minX;\n';
+  } else if (horizontal === 'center') {
+    script += '  dx = (comp.width - (b.maxX - b.minX)) / 2 - b.minX;\n';
+  } else if (horizontal === 'right') {
+    script += '  dx = comp.width - __pad - b.maxX;\n';
+  }
+  if (vertical === 'top') {
+    script += '  dy = __pad - b.minY;\n';
+  } else if (vertical === 'middle') {
+    script += '  dy = (comp.height - (b.maxY - b.minY)) / 2 - b.minY;\n';
+  } else if (vertical === 'bottom') {
+    script += '  dy = comp.height - __pad - b.maxY;\n';
+  }
+  script += '  return [dx, dy];\n';
+  script += '};\n';
+
+  // Apply a comp-space delta to a layer's Position, shifting every
+  // keyframe when the position is animated (separated dimensions included).
+  script += 'var __shiftDim = function (p, dd) {\n';
+  script += '  if (!p) return;\n';
+  script += '  if (p.numKeys > 0) {\n';
+  script += '    for (var kk = 1; kk <= p.numKeys; kk++) {\n';
+  script += '      p.setValueAtKey(kk, p.keyValue(kk) + dd);\n';
+  script += '    }\n';
+  script += '  } else {\n';
+  script += '    p.setValue(p.value + dd);\n';
+  script += '  }\n';
+  script += '};\n';
+  script += 'var __shift = function (lyr, dx, dy) {\n';
+  script += '  var dp = __compDeltaToParent(lyr, dx, dy);\n';
+  script += '  var tr = lyr.property("ADBE Transform Group");\n';
+  script += '  var posProp = tr.property("ADBE Position");\n';
+  script += '  if (posProp.dimensionsSeparated) {\n';
+  script += '    __shiftDim(tr.property("ADBE Position_0"), dp[0]);\n';
+  script += '    __shiftDim(tr.property("ADBE Position_1"), dp[1]);\n';
+  script += '  } else if (posProp.numKeys > 0) {\n';
+  script += '    for (var kk = 1; kk <= posProp.numKeys; kk++) {\n';
+  script += '      var kv = posProp.keyValue(kk);\n';
+  script += '      posProp.setValueAtKey(kk, kv.length > 2 ? [kv[0] + dp[0], kv[1] + dp[1], kv[2]] : [kv[0] + dp[0], kv[1] + dp[1]]);\n';
+  script += '    }\n';
+  script += '  } else {\n';
+  script += '    var pv = posProp.value;\n';
+  script += '    posProp.setValue(pv.length > 2 ? [pv[0] + dp[0], pv[1] + dp[1], pv[2]] : [pv[0] + dp[0], pv[1] + dp[1]]);\n';
+  script += '  }\n';
+  script += '};\n';
+  // A selected layer parented (directly or not) to another selected layer
+  // already follows its parent's move — moving it too would double the shift.
+  script += 'var __hasSelectedAncestor = function (lyr) {\n';
+  script += '  var cur = lyr.parent;\n';
+  script += '  while (cur) {\n';
+  script += '    for (var q = 0; q < layersToAlign.length; q++) {\n';
+  script += '      if (layersToAlign[q].index === cur.index) return true;\n';
+  script += '    }\n';
+  script += '    cur = cur.parent;\n';
+  script += '  }\n';
+  script += '  return false;\n';
+  script += '};\n';
+
+  script += 'var relockList = [];\n';
+  script += 'for (var lk = 0; lk < layersToAlign.length; lk++) {\n';
+  script += '  if (layersToAlign[lk].locked) {\n';
+  script += '    layersToAlign[lk].locked = false;\n';
+  script += '    relockList.push(layersToAlign[lk]);\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += 'var alignedNames = [];\n';
+  script += 'var groupDelta = null;\n';
+  script += 'try {\n';
+  if (mode === 'group') {
+    script += '  var union = null;\n';
+    script += '  for (var bb = 0; bb < layersToAlign.length; bb++) {\n';
+    script += '    union = __unionBounds(union, __bounds(layersToAlign[bb]));\n';
+    script += '  }\n';
+    script += '  groupDelta = __deltaFor(union);\n';
+    script += '  for (var mv = 0; mv < layersToAlign.length; mv++) {\n';
+    script += '    if (__hasSelectedAncestor(layersToAlign[mv])) continue;\n';
+    script += '    __shift(layersToAlign[mv], groupDelta[0], groupDelta[1]);\n';
+    script += '    alignedNames.push(layersToAlign[mv].name);\n';
+    script += '  }\n';
+  } else {
+    // Compute every delta first: moving a layer must not skew the
+    // measurement of the next one (parented selections).
+    script += '  var deltas = [];\n';
+    script += '  for (var bb = 0; bb < layersToAlign.length; bb++) {\n';
+    script += '    deltas.push(__deltaFor(__bounds(layersToAlign[bb])));\n';
+    script += '  }\n';
+    script += '  for (var mv = 0; mv < layersToAlign.length; mv++) {\n';
+    script += '    __shift(layersToAlign[mv], deltas[mv][0], deltas[mv][1]);\n';
+    script += '    alignedNames.push(layersToAlign[mv].name);\n';
+    script += '  }\n';
+  }
+  script += '} finally {\n';
+  script += '  for (var r = 0; r < relockList.length; r++) {\n';
+  script += '    relockList[r].locked = true;\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += generateResultObject({
+    success: 'true',
+    mode: '"' + mode + '"',
+    alignedLayers: 'alignedNames',
+    deltaX: 'groupDelta ? Math.round(groupDelta[0] * 100) / 100 : null',
+    deltaY: 'groupDelta ? Math.round(groupDelta[1] * 100) / 100 : null'
+  });
+
+  return wrapInUndoGroup(script, 'Align Layers');
+}
+
+/**
+ * Generate script to copy layers between compositions.
+ * Uses layer.copyToComp(), which preserves everything on the layer:
+ * text animators, keyframes, expressions, masks, effects, transforms.
+ */
+export function generateCopyLayers(params: {
+  sourceCompId?: number;
+  sourceCompName?: string;
+  targetCompId?: number;
+  targetCompName?: string;
+  layerIndices?: number[];
+  layerNames?: string[];
+  timeOffset?: number;
+}): string {
+  let script = '';
+  script += generateProjectCheck();
+
+  script += generateCompAccess(params.sourceCompId, params.sourceCompName);
+  script += 'var sourceComp = comp;\n';
+  script += generateCompAccess(params.targetCompId, params.targetCompName);
+  script += 'var targetComp = comp;\n';
+
+  script += 'var layersToCopy = [];\n';
+  script += 'var notFound = [];\n';
+
+  if (params.layerIndices && params.layerIndices.length > 0) {
+    script += 'var idxs = ' + arrayToES3(params.layerIndices) + ';\n';
+    script += 'for (var d = 0; d < idxs.length; d++) {\n';
+    script += '  if (idxs[d] >= 1 && idxs[d] <= sourceComp.numLayers) {\n';
+    script += '    layersToCopy.push(sourceComp.layer(idxs[d]));\n';
+    script += '  } else {\n';
+    script += '    notFound.push("index:" + idxs[d]);\n';
+    script += '  }\n';
+    script += '}\n';
+  }
+
+  if (params.layerNames && params.layerNames.length > 0) {
+    script += 'var names = ' + arrayToES3(params.layerNames) + ';\n';
+    script += 'for (var n = 0; n < names.length; n++) {\n';
+    script += '  var matched = false;\n';
+    script += '  for (var i = 1; i <= sourceComp.numLayers; i++) {\n';
+    script += '    if (sourceComp.layer(i).name === names[n]) {\n';
+    script += '      layersToCopy.push(sourceComp.layer(i));\n';
+    script += '      matched = true;\n';
+    script += '    }\n';
+    script += '  }\n';
+    script += '  if (!matched) {\n';
+    script += '    notFound.push(names[n]);\n';
+    script += '  }\n';
+    script += '}\n';
+  }
+
+  if ((!params.layerIndices || params.layerIndices.length === 0) &&
+      (!params.layerNames || params.layerNames.length === 0)) {
+    script += 'for (var i = 1; i <= sourceComp.numLayers; i++) {\n';
+    script += '  layersToCopy.push(sourceComp.layer(i));\n';
+    script += '}\n';
+  }
+
+  // copyToComp() looks like the right API but silently drops text animators
+  // (and other property groups added after layer creation). Go through AE's
+  // real clipboard instead: scripted menu Copy/Paste is the same full-fidelity
+  // copy as manual Ctrl+C/Ctrl+V, and also preserves parent links between
+  // layers copied together. Menu command IDs are resolved by localized name.
+  script += 'var __findCmd = function (names) {\n';
+  script += '  for (var f = 0; f < names.length; f++) {\n';
+  script += '    try {\n';
+  script += '      var cmdId = app.findMenuCommandId(names[f]);\n';
+  script += '      if (cmdId) return cmdId;\n';
+  script += '    } catch (eCmd) {}\n';
+  script += '  }\n';
+  script += '  return 0;\n';
+  script += '};\n';
+
+  script += 'var copiedLayers = [];\n';
+  script += 'if (layersToCopy.length > 0) {\n';
+  script += '  var copyCmd = __findCmd(["Copy", "Copier"]);\n';
+  script += '  var pasteCmd = __findCmd(["Paste", "Coller"]);\n';
+  script += '  if (!copyCmd || !pasteCmd) {\n';
+  script += '    throw new Error("Could not resolve Copy/Paste menu commands for this AE UI language");\n';
+  script += '  }\n';
+
+  // Locked layers cannot be selected — unlock them for the copy, relock after
+  script += '  var relockList = [];\n';
+  script += '  for (var t = 0; t < layersToCopy.length; t++) {\n';
+  script += '    if (layersToCopy[t].locked) {\n';
+  script += '      layersToCopy[t].locked = false;\n';
+  script += '      relockList.push(layersToCopy[t]);\n';
+  script += '    }\n';
+  script += '  }\n';
+
+  // Menu Copy/Paste act on the ACTIVE panel. If another panel keeps focus
+  // (project panel, CEP panel...), Copy silently does nothing and Paste
+  // re-pastes the previous clipboard content. So: force the viewer active
+  // (setActive), then verify after paste that what landed matches what was
+  // requested — on mismatch, roll the paste back and retry once, and if it
+  // still fails, fail loudly instead of returning wrong layers as a success.
+  script += '  var expectedNames = [];\n';
+  script += '  for (var en = 0; en < layersToCopy.length; en++) {\n';
+  script += '    expectedNames.push(layersToCopy[en].name);\n';
+  script += '  }\n';
+  // Pasted names may get a numeric suffix on collision ("Titre" -> "Titre 2"),
+  // and an existing trailing number is incremented ("Titre 2" -> "Titre 3"),
+  // so names are compared with any trailing number stripped.
+  script += '  var __stem = function (n) { return n.replace(/\\s+[0-9]+$/, ""); };\n';
+  script += '  var __validatePasted = function (pasted) {\n';
+  script += '    if (pasted.length !== expectedNames.length) return false;\n';
+  script += '    var consumed = [];\n';
+  script += '    for (var c = 0; c < expectedNames.length; c++) consumed.push(false);\n';
+  script += '    for (var pv = 0; pv < pasted.length; pv++) {\n';
+  script += '      var pn = pasted[pv].name;\n';
+  script += '      var ok = false;\n';
+  script += '      for (var c2 = 0; c2 < expectedNames.length; c2++) {\n';
+  script += '        if (consumed[c2]) continue;\n';
+  script += '        var base = expectedNames[c2];\n';
+  script += '        if (pn === base || __stem(pn) === __stem(base)) {\n';
+  script += '          consumed[c2] = true;\n';
+  script += '          ok = true;\n';
+  script += '          break;\n';
+  script += '        }\n';
+  script += '      }\n';
+  script += '      if (!ok) return false;\n';
+  script += '    }\n';
+  script += '    return true;\n';
+  script += '  };\n';
+
+  script += '  var pastedLayers = [];\n';
+  script += '  var attemptOk = false;\n';
+  script += '  for (var att = 0; att < 2 && !attemptOk; att++) {\n';
+  script += '    var srcViewer = sourceComp.openInViewer();\n';
+  script += '    if (srcViewer && srcViewer.setActive) srcViewer.setActive();\n';
+  script += '    for (var s = 1; s <= sourceComp.numLayers; s++) {\n';
+  script += '      sourceComp.layer(s).selected = false;\n';
+  script += '    }\n';
+  script += '    for (var t2 = 0; t2 < layersToCopy.length; t2++) {\n';
+  script += '      layersToCopy[t2].selected = true;\n';
+  script += '    }\n';
+  script += '    app.executeCommand(copyCmd);\n';
+  script += '    var tgtViewer = targetComp.openInViewer();\n';
+  script += '    if (tgtViewer && tgtViewer.setActive) tgtViewer.setActive();\n';
+  script += '    for (var u = 1; u <= targetComp.numLayers; u++) {\n';
+  script += '      targetComp.layer(u).selected = false;\n';
+  script += '    }\n';
+  script += '    app.executeCommand(pasteCmd);\n';
+  // Pasted layers come back selected — that is how we identify them
+  script += '    pastedLayers = targetComp.selectedLayers;\n';
+  script += '    if (__validatePasted(pastedLayers)) {\n';
+  script += '      attemptOk = true;\n';
+  script += '    } else {\n';
+  script += '      for (var rb = 0; rb < pastedLayers.length; rb++) {\n';
+  script += '        try { pastedLayers[rb].remove(); } catch (eRb) {}\n';
+  script += '      }\n';
+  script += '    }\n';
+  script += '  }\n';
+
+  script += '  for (var r = 0; r < relockList.length; r++) {\n';
+  script += '    relockList[r].locked = true;\n';
+  script += '  }\n';
+
+  script += '  if (!attemptOk) {\n';
+  script += '    throw new Error("copy_layers: the clipboard copy did not take (the paste produced different layers than requested, likely a panel focus issue). The bad paste was rolled back automatically — retry the call.");\n';
+  script += '  }\n';
+
+  script += '  for (var p = 0; p < pastedLayers.length; p++) {\n';
+  if (params.timeOffset !== undefined && params.timeOffset !== 0) {
+    script += '    pastedLayers[p].startTime = pastedLayers[p].startTime + ' + params.timeOffset + ';\n';
+  }
+  script += '    copiedLayers.push(pastedLayers[p].name);\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += generateResultObject({
+    success: 'true',
+    sourceComp: 'sourceComp.name',
+    targetComp: 'targetComp.name',
+    copiedCount: 'copiedLayers.length',
+    copiedLayers: 'copiedLayers',
+    notFound: 'notFound'
+  });
+
+  return wrapInUndoGroup(script, 'Copy Layers');
+}
+
 /**
  * Generate script to list all layers in a composition
  */
 export function generateListLayers(params: {
   compId?: number;
   compName?: string;
+  includeText?: boolean;
 }): string {
   let script = '';
   script += generateProjectCheck();
@@ -638,9 +1419,10 @@ export function generateListLayers(params: {
   script += '  else if (layer.adjustmentLayer) layerType = "adjustment";\n';
   script += '  else if (layer.nullLayer) layerType = "null";\n';
   script += '  else if (layer.source instanceof CompItem) layerType = "precomp";\n';
+  script += '  else if (layer.source && layer.source.mainSource instanceof SolidSource) layerType = "solid";\n';
   script += '  else if (layer.source) layerType = "av";\n';
-  script += '  else layerType = "solid";\n';
-  script += '  layers.push({\n';
+  script += '  else layerType = "unknown";\n';
+  script += '  var entry = {\n';
   script += '    index: layer.index,\n';
   script += '    name: layer.name,\n';
   script += '    type: layerType,\n';
@@ -653,7 +1435,16 @@ export function generateListLayers(params: {
   script += '    startTime: layer.startTime,\n';
   script += '    is3D: layer.threeDLayer,\n';
   script += '    parent: layer.parent ? layer.parent.index : null\n';
-  script += '  });\n';
+  script += '  };\n';
+  script += '  if (layer.source) {\n';
+  script += '    try { entry.source = layer.source.name; } catch (eSrc) {}\n';
+  script += '  }\n';
+  if (params.includeText) {
+    script += '  if (layer instanceof TextLayer) {\n';
+    script += '    try { entry.text = layer.property("Source Text").value.text; } catch (eTxt) {}\n';
+    script += '  }\n';
+  }
+  script += '  layers.push(entry);\n';
   script += '}\n';
   script += 'layers;\n';
 
@@ -682,8 +1473,9 @@ export function generateGetLayerInfo(params: {
   script += 'else if (layer.adjustmentLayer) layerType = "adjustment";\n';
   script += 'else if (layer.nullLayer) layerType = "null";\n';
   script += 'else if (layer.source instanceof CompItem) layerType = "precomp";\n';
+  script += 'else if (layer.source && layer.source.mainSource instanceof SolidSource) layerType = "solid";\n';
   script += 'else if (layer.source) layerType = "av";\n';
-  script += 'else layerType = "solid";\n';
+  script += 'else layerType = "unknown";\n';
 
   script += 'var info = {\n';
   script += '  index: layer.index,\n';
@@ -711,6 +1503,62 @@ export function generateGetLayerInfo(params: {
   script += '  info.rotation = layer.property("Rotation") ? layer.property("Rotation").value : 0;\n';
   script += '  info.opacity = layer.property("Opacity").value;\n';
   script += '  info.anchorPoint = layer.property("Anchor Point").value;\n';
+  script += '}\n';
+
+  // Text layers: expose the TextDocument (font, size, colors, content).
+  // Individual properties are wrapped in try/catch because some throw
+  // depending on point vs paragraph text and AE version.
+  script += 'if (layer instanceof TextLayer) {\n';
+  script += '  try {\n';
+  script += '    var textDoc = layer.property("Source Text").value;\n';
+  script += '    var textInfo = {};\n';
+  script += '    textInfo.text = textDoc.text;\n';
+  script += '    try { textInfo.font = textDoc.font; } catch (e1) {}\n';
+  script += '    try {\n';
+  script += '      if (textDoc.fontObject) {\n';
+  script += '        textInfo.fontFamily = textDoc.fontObject.familyName;\n';
+  script += '        textInfo.fontStyle = textDoc.fontObject.styleName;\n';
+  script += '      }\n';
+  script += '    } catch (e2) {}\n';
+  script += '    try { textInfo.fontSize = textDoc.fontSize; } catch (e3) {}\n';
+  script += '    try {\n';
+  script += '      if (textDoc.applyFill) {\n';
+  script += '        textInfo.fillColor = [textDoc.fillColor[0], textDoc.fillColor[1], textDoc.fillColor[2]];\n';
+  script += '      }\n';
+  script += '    } catch (e4) {}\n';
+  script += '    try {\n';
+  script += '      if (textDoc.applyStroke) {\n';
+  script += '        textInfo.strokeColor = [textDoc.strokeColor[0], textDoc.strokeColor[1], textDoc.strokeColor[2]];\n';
+  script += '        textInfo.strokeWidth = textDoc.strokeWidth;\n';
+  script += '      }\n';
+  script += '    } catch (e5) {}\n';
+  script += '    try { textInfo.tracking = textDoc.tracking; } catch (e6) {}\n';
+  script += '    try { textInfo.leading = textDoc.autoLeading ? "auto" : textDoc.leading; } catch (e7) {}\n';
+  script += '    try {\n';
+  script += '      var just = textDoc.justification;\n';
+  script += '      if (just === ParagraphJustification.LEFT_JUSTIFY) textInfo.justification = "LEFT";\n';
+  script += '      else if (just === ParagraphJustification.CENTER_JUSTIFY) textInfo.justification = "CENTER";\n';
+  script += '      else if (just === ParagraphJustification.RIGHT_JUSTIFY) textInfo.justification = "RIGHT";\n';
+  script += '      else textInfo.justification = "OTHER";\n';
+  script += '    } catch (e8) {}\n';
+  script += '    try {\n';
+  script += '      textInfo.isBoxText = textDoc.boxText;\n';
+  script += '      if (textDoc.boxText) {\n';
+  script += '        textInfo.boxSize = [textDoc.boxTextSize[0], textDoc.boxTextSize[1]];\n';
+  script += '      }\n';
+  script += '    } catch (e9) {}\n';
+  script += '    info.textDocument = textInfo;\n';
+  script += '  } catch (eText) {\n';
+  script += '    info.textDocumentError = eText.toString();\n';
+  script += '  }\n';
+  script += '}\n';
+
+  // Solid layers: expose the solid color
+  script += 'if (layerType === "solid") {\n';
+  script += '  try {\n';
+  script += '    var solidColor = layer.source.mainSource.color;\n';
+  script += '    info.solidColor = [solidColor[0], solidColor[1], solidColor[2]];\n';
+  script += '  } catch (eSolid) {}\n';
   script += '}\n';
 
   script += 'info;\n';

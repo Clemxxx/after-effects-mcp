@@ -58,6 +58,8 @@ Different properties require specific value formats:
 
 ### 2. Text Animation Pattern
 
+New text layers spawn CENTERED: the anchor point is placed at the center of the text block and `position` (default: comp center) means the center of that block — same predictable placement as footage layers. No need to compensate for AE's baseline-left default.
+
 ```
 1. Add text layer with content
 2. Set text properties (fontSize, color, position, justification)
@@ -111,10 +113,19 @@ Different properties require specific value formats:
 - inEase/outEase: `{speed: number, influence: number}`
 - Use for smooth, professional motion
 
+**set_keyframes** - Bulk keyframe setting (PREFER for 3+ keys on one property):
+- Sets 50-100+ keyframes on ONE property in a single call: `set_keyframes(property: "Source Text", keyframes: [{time: 0, value: "A"}, {time: 2.5, value: "B"}, ...])`
+- The layer/property is resolved once — far faster than repeated set_keyframe or a batch_execute of set_keyframe steps
+- Each keyframe can carry its own inType/outType/inEase/outEase, so a whole eased animation fits in one call
+- One undo group for the whole batch; typical uses: all subtitle text changes of a video, a full Position path, a beat-synced Scale pulse
+- For several properties at once, combine with batch_execute: one set_keyframes step per property
+
 **apply_easy_ease** - Quick easing application:
 - Apply to existing keyframes
 - Type: `IN`, `OUT`, `BOTH`
 - Can target specific keyframe by index or all keyframes
+
+**Text keyframes** - "Source Text" is keyframable: `set_keyframe(property: "Source Text", time: 2, value: "NEW TEXT")` changes the displayed text over time on a SINGLE layer (e.g. countdowns, rotating words); for many text changes use set_keyframes with the whole list in one call. After Effects forces HOLD interpolation on text keys — the text switches instantly at each keyframe, no easing needed. The layer's styling (font, size, color) is preserved: the value is applied through the layer's existing TextDocument. Text animators keep running across text changes.
 
 ### Layer References
 
@@ -123,6 +134,8 @@ Layers can be identified by:
 - `layerIndex`: 1-based (1 = top layer)
 
 When modifying layers, always verify layer exists first via list_layers or get_layer_info.
+
+list_layers is the fastest way to understand a whole composition in ONE call: it returns stacking order (index 1 = top), layer type, timing (inPoint/outPoint/startTime), parenting, and the `source` item name of footage/precomp layers. Pass `includeText: true` to also get the `text` content of every text layer (off by default to keep responses small). Only fall back to get_layer_info when you need transform values or full text styling for a specific layer.
 
 ### Composition Management
 
@@ -198,7 +211,12 @@ When shape operations fail with "property is hidden" error, the layer structure 
 2. **Precomposing**: Group related layers into precomps for organization
 3. **Markers**: Add markers for timing references and notes
 4. **Work area**: Set work area to focus rendering on specific sections
-5. **Project structure**: Organize footage into folders using organize_project_items
+5. **Project structure**: Organize footage into folders using organize_project_items (automatic by type/usage) or move_project_items (move named items into a nested folder path like "PRODUCT/AUDIOS", creating folders as needed)
+6. **Reusing animated layers**: Prefer copy_layers over recreating layers manually — it goes through AE's real clipboard, so the copy is full fidelity (text animators, keyframes, expressions, masks, effects). Use timeOffset to retime the copies. Parent links survive when parent and children are copied in the same call. For text templates, the workflow is: copy_layers (keeps the animation) then set_text_content (swaps the words, keeps animators) — never recreate an animated text layer from scratch. The tool verifies the paste against the requested layers (a stale clipboard / focus glitch is detected, rolled back and retried automatically); if it still throws "the clipboard copy did not take", just retry the call — no parasite layers are left behind.
+7. **Aligning/centering on the canvas**: Use align_layers instead of computing positions by hand — horizontal (left/center/right) and/or vertical (top/middle/bottom), optional padding from the edges. Several layers are treated as ONE group by default: the combined bounding box is aligned and everything moves by the same delta, so the layout between the layers is preserved (mode: "individual" aligns each separately). Bounds are the REAL rendered bounds (anchor point, scale, rotation and parenting accounted for; text measured via sourceRectAtTime), and animated positions are shifted keyframe by keyframe so the whole animation moves. For text/animated layers pass `time` to measure at a moment where the content is fully visible.
+8. **Layer stacking order**: New layers (add_av_layer, add_solid_layer, copy_layers...) are always created at the top of the stack — guaranteed (add_av_layer explicitly forces the top spot, since AE's own API does not promise it for footage). Use reorder_layer to move them afterwards — e.g. reorder_layer(layerName: "BG", position: "bottom") to send a background behind everything.
+9. **Repetitive operations**: Use batch_execute to run many tool calls in one round-trip instead of one call at a time (e.g. setting startTime on 13 audio layers = one batch of 13 modify_layer steps). Each step reports success/error individually. Keep batches under ~50 steps to stay within the 60s command timeout. Exception: many keyframes on ONE property is NOT a batch_execute job — use set_keyframes, which takes 100+ keys in a single step.
+10. **Mixed text formatting** (AE 24.3+): A single text block can mix styles (e.g. one word in Bold Italic). get_layer_info only reports the FIRST character's style — use get_text_styles to see the real formatting runs, and set_text_style_range to style a substring (matchText) without touching the rest. Bold/italic are separate font instances in AE: prefer fontFamily "Montserrat" + fontStyle "Bold Italic" (validated against installed fonts) over guessing PostScript names.
 
 ## Animation Timing Guidelines
 
@@ -285,3 +303,6 @@ When working with imported footage:
 - list_compositions, list_layers
 - get_composition_info, get_layer_info
 - precompose_layers
+
+**Visual feedback:**
+- get_composition_frame — renders a frame of a composition and returns it as an image. Use it after making visual changes to see the actual result and catch layout, color, or timing mistakes.

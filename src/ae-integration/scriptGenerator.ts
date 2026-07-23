@@ -23,6 +23,7 @@ export {
   generateDeleteComposition,
   generateListCompositions,
   generateGetCompositionInfo,
+  generateGetCompositionFrame,
   generateSetActiveComposition
 } from './generators/compositionGenerators.js';
 
@@ -40,6 +41,12 @@ export {
   generatePrecomposeLayers,
   generateModifyLayer,
   generateDeleteLayer,
+  generateCopyLayers,
+  generateReorderLayer,
+  generateAlignLayers,
+  generateGetTextStyles,
+  generateSetTextStyleRange,
+  generateSetTextContent,
   generateListLayers,
   generateGetLayerInfo
 } from './generators/layerGenerators.js';
@@ -48,6 +55,7 @@ export {
 export {
   generateSetKeyframe,
   generateSetKeyframeAdvanced,
+  generateSetKeyframes,
   generateApplyEasyEase,
   generateSetTemporalEase,
   generateOffsetKeyframes,
@@ -96,6 +104,7 @@ export {
   generateImportFolder,
   generateReplaceFootage,
   generateOrganizeProjectItems,
+  generateMoveProjectItems,
   generateFindMissingFootage,
   generateCollectFiles,
   generateReduceProject,

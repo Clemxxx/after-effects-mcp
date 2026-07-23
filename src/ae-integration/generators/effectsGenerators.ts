@@ -523,10 +523,10 @@ export function generateCopyEffects(params: {
   script += '  }\n';
   script += '}\n';
 
-  script += '{\n';
-  script += '  copiedEffects: copiedEffects,\n';
-  script += '  count: copiedEffects.length\n';
-  script += '};\n';
+  script += generateResultObject({
+    copiedEffects: 'copiedEffects',
+    count: 'copiedEffects.length'
+  });
 
   return wrapInUndoGroup(script, 'Copy Effects');
 }

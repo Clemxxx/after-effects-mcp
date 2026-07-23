@@ -16,8 +16,14 @@ import {
   GetPromptRequestSchema
 } from '@modelcontextprotocol/sdk/types.js';
 
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import sharp from 'sharp';
+
 import { FileCommunicator } from './ae-integration/file-communicator.js';
 import * as generators from './ae-integration/scriptGenerator.js';
+import { escapeString } from './ae-integration/generators/helpers.js';
 import { createErrorResponse } from './ae-integration/errorHandler.js';
 import { Logger } from './types/mcpTypes.js';
 
@@ -196,6 +202,22 @@ const TOOLS = [
     },
     generator: generators.generateGetCompositionInfo
   },
+  {
+    name: 'get_composition_frame',
+    description: 'Render a single frame of a composition and return it as an image, so you can see the current visual state of your work. Defaults to the active composition at its current playhead time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number', description: 'Composition ID' },
+        compName: { type: 'string', description: 'Composition name (defaults to the active composition)' },
+        time: { type: 'number', description: 'Time in seconds to render (defaults to the current playhead time)' },
+        maxSize: { type: 'number', description: 'Maximum width/height of the returned image in pixels (default 1024)' },
+        format: { type: 'string', enum: ['jpeg', 'png'], description: 'Returned image format (default jpeg; use png to preserve transparency)' }
+      }
+    },
+    generator: generators.generateGetCompositionFrame,
+    returnsImage: true
+  },
 
   // ============================================
   // LAYER TOOLS
@@ -225,7 +247,7 @@ const TOOLS = [
   },
   {
     name: 'add_text_layer',
-    description: 'Add a text layer to a composition',
+    description: 'Add a text layer to a composition. The anchor point is centered on the text block, so `position` is the CENTER of the text and defaults to the center of the comp',
     inputSchema: {
       type: 'object',
       properties: {
@@ -233,7 +255,7 @@ const TOOLS = [
         compName: { type: 'string', description: 'Composition name' },
         text: { type: 'string', description: 'Text content' },
         name: { type: 'string', description: 'Layer name' },
-        position: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } } },
+        position: { type: 'object', description: 'Center of the text block (default: comp center)', properties: { x: { type: 'number' }, y: { type: 'number' } } },
         fontSize: { type: 'number', description: 'Font size in pixels' },
         fontFamily: { type: 'string', description: 'Font family name' },
         color: { type: 'object', description: 'Text color (0-1 range)' },
@@ -245,7 +267,7 @@ const TOOLS = [
   },
   {
     name: 'add_text_layer_advanced',
-    description: 'Add a text layer with advanced styling options',
+    description: 'Add a text layer with advanced styling options. The anchor point is centered on the text block, so `position` is the CENTER of the text and defaults to the center of the comp',
     inputSchema: {
       type: 'object',
       properties: {
@@ -253,7 +275,7 @@ const TOOLS = [
         compName: { type: 'string' },
         text: { type: 'string', description: 'Text content' },
         name: { type: 'string' },
-        position: { type: 'object' },
+        position: { type: 'object', description: 'Center of the text block (default: comp center)' },
         fontSize: { type: 'number' },
         fontFamily: { type: 'string' },
         color: { type: 'object' },
@@ -424,20 +446,131 @@ const TOOLS = [
     generator: generators.generateDeleteLayer
   },
   {
-    name: 'list_layers',
-    description: 'List all layers in a composition',
+    name: 'copy_layers',
+    description: 'Copy layers from one composition to another (or duplicate within the same comp) via AE\'s clipboard — full fidelity: text animators, keyframes, expressions, masks, effects. Parent links between layers copied in the same call are preserved (a parent left out is dropped). Omit layerIndices/layerNames to copy all layers. Note: replaces the current clipboard content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sourceCompId: { type: 'number' },
+        sourceCompName: { type: 'string', description: 'Source composition (defaults to active comp)' },
+        targetCompId: { type: 'number' },
+        targetCompName: { type: 'string', description: 'Target composition (defaults to active comp)' },
+        layerIndices: { type: 'array', items: { type: 'number' }, description: 'Indices of layers to copy' },
+        layerNames: { type: 'array', items: { type: 'string' }, description: 'Names of layers to copy (all matches are copied)' },
+        timeOffset: { type: 'number', description: 'Seconds added to each copied layer\'s startTime (to retime the copy)' }
+      }
+    },
+    generator: generators.generateCopyLayers
+  },
+  {
+    name: 'reorder_layer',
+    description: 'Move a layer in the stacking order: to top/bottom, before/after another layer, or to an absolute index. Useful to put a background layer behind everything after adding it.',
     inputSchema: {
       type: 'object',
       properties: {
         compId: { type: 'number' },
-        compName: { type: 'string' }
+        compName: { type: 'string' },
+        layerIndex: { type: 'number', description: 'Layer to move (by index)' },
+        layerName: { type: 'string', description: 'Layer to move (by name)' },
+        position: { type: 'string', enum: ['top', 'bottom', 'before', 'after', 'index'], description: 'Where to move the layer' },
+        targetIndex: { type: 'number', description: 'Destination index (required when position is "index"; 1 = top)' },
+        referenceLayerIndex: { type: 'number', description: 'Reference layer (required when position is "before"/"after")' },
+        referenceLayerName: { type: 'string', description: 'Reference layer by name (alternative to referenceLayerIndex)' }
+      },
+      required: ['position']
+    },
+    generator: generators.generateReorderLayer
+  },
+  {
+    name: 'align_layers',
+    description: 'Align/center one or several layers on the composition canvas (horizontal: left/center/right, vertical: top/middle/bottom). By default several layers are treated as ONE group: their combined bounding box is aligned and every layer moves by the same delta, preserving the relative layout between them. Bounds account for anchor point, scale, rotation and parenting; animated positions are shifted keyframe by keyframe.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        layerNames: { type: 'array', items: { type: 'string' }, description: 'Layers to align (by name)' },
+        layerIndices: { type: 'array', items: { type: 'number' }, description: 'Layers to align (by 1-based index)' },
+        horizontal: { type: 'string', enum: ['left', 'center', 'right'], description: 'Horizontal alignment on the canvas' },
+        vertical: { type: 'string', enum: ['top', 'middle', 'bottom'], description: 'Vertical alignment on the canvas' },
+        mode: { type: 'string', enum: ['group', 'individual'], description: 'group (default): move all layers by one shared delta, keeping their relative layout. individual: align each layer separately' },
+        padding: { type: 'number', description: 'Margin in pixels kept from the canvas edge for left/right/top/bottom alignments (default 0)' },
+        time: { type: 'number', description: 'Time in seconds at which bounds are measured (default: current comp time). Matters for animated/text layers' }
+      }
+    },
+    generator: generators.generateAlignLayers
+  },
+  {
+    name: 'get_text_styles',
+    description: 'Read the per-character formatting of a text layer as style runs (font, size, colors, faux bold/italic...). Detects mixed formatting within a single text block. Requires AE 24.3+.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        layerIndex: { type: 'number' },
+        layerName: { type: 'string' }
+      }
+    },
+    generator: generators.generateGetTextStyles
+  },
+  {
+    name: 'set_text_content',
+    description: 'Replace the text content of an existing text layer. Text animators, keyframes and expressions are preserved (they live on the layer, not the text). Ideal after copy_layers from a template: copy the animated layer, then swap its text. Note: if the layer had MIXED per-character styles, re-apply them with set_text_style_range afterwards.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        layerIndex: { type: 'number' },
+        layerName: { type: 'string' },
+        text: { type: 'string', description: 'New text content (use \\n for line breaks)' }
+      },
+      required: ['text']
+    },
+    generator: generators.generateSetTextContent
+  },
+  {
+    name: 'set_text_style_range',
+    description: 'Apply a style (font, size, color, faux bold/italic, tracking) to a character range inside a text layer, preserving the rest of the formatting — e.g. make one word bold italic. Select the range with matchText (first occurrence) or startIndex/endIndex. Requires AE 24.3+.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        layerIndex: { type: 'number' },
+        layerName: { type: 'string' },
+        matchText: { type: 'string', description: 'Substring to style (first occurrence). Alternative to startIndex/endIndex.' },
+        startIndex: { type: 'number', description: '0-based start of the range (inclusive)' },
+        endIndex: { type: 'number', description: 'End of the range (exclusive)' },
+        font: { type: 'string', description: 'PostScript font name (e.g. "Montserrat-BoldItalic"). Alternative to fontFamily+fontStyle.' },
+        fontFamily: { type: 'string', description: 'Font family name (e.g. "Montserrat"); requires fontStyle' },
+        fontStyle: { type: 'string', description: 'Style name (e.g. "Bold Italic")' },
+        fontSize: { type: 'number' },
+        fillColor: { type: 'object', properties: { r: { type: 'number' }, g: { type: 'number' }, b: { type: 'number' } }, description: 'RGB 0-1' },
+        fauxBold: { type: 'boolean' },
+        fauxItalic: { type: 'boolean' },
+        tracking: { type: 'number' }
+      }
+    },
+    generator: generators.generateSetTextStyleRange
+  },
+  {
+    name: 'list_layers',
+    description: 'List all layers in a composition (stacking order, type, timing, source item name of footage/precomp layers). Pass includeText: true to also get the text content of every text layer — useful to understand a whole composition in one call',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        includeText: { type: 'boolean', description: 'Include the text content of text layers (default false)' }
       }
     },
     generator: generators.generateListLayers
   },
   {
     name: 'get_layer_info',
-    description: 'Get detailed information about a layer',
+    description: 'Get detailed information about a layer, including transform values, text properties for text layers (font, size, fill/stroke colors, justification, content), and color for solid layers',
     inputSchema: {
       type: 'object',
       properties: {
@@ -492,6 +625,38 @@ const TOOLS = [
       required: ['property', 'time', 'value']
     },
     generator: generators.generateSetKeyframeAdvanced
+  },
+  {
+    name: 'set_keyframes',
+    description: 'Set MANY keyframes on one property in a single call (50, 100+ keys at once) — e.g. all the Source Text changes of a subtitle layer, or a full Position path. The layer/property is resolved once and every key is added in one script, so it is far faster than repeated set_keyframe calls. Each keyframe can carry its own interpolation and easing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        layerIndex: { type: 'number' },
+        layerName: { type: 'string' },
+        property: { type: 'string', description: 'Property name (e.g., "Position", "Opacity", "Source Text")' },
+        keyframes: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              time: { type: 'number', description: 'Time in seconds' },
+              value: { description: 'Property value (number, array, or string for Source Text)' },
+              inType: { type: 'string', enum: ['LINEAR', 'BEZIER', 'HOLD'] },
+              outType: { type: 'string', enum: ['LINEAR', 'BEZIER', 'HOLD'] },
+              inEase: { type: 'object', properties: { speed: { type: 'number' }, influence: { type: 'number' } } },
+              outEase: { type: 'object', properties: { speed: { type: 'number' }, influence: { type: 'number' } } }
+            },
+            required: ['time', 'value']
+          },
+          description: 'All keyframes to set on this property, in one go'
+        }
+      },
+      required: ['property', 'keyframes']
+    },
+    generator: generators.generateSetKeyframes
   },
   {
     name: 'apply_easy_ease',
@@ -1029,6 +1194,20 @@ const TOOLS = [
     generator: generators.generateOrganizeProjectItems
   },
   {
+    name: 'move_project_items',
+    description: 'Move project items into a folder by name or ID. Creates the folder path (nested with "/", e.g. "PRODUCT/AUDIOS") if it does not exist. Items can be footage, comps, solids or folders.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        folderPath: { type: 'string', description: 'Destination folder path, "/" separated for nesting (e.g. "NEO-SERUM/AUDIOS"). Missing folders are created.' },
+        itemNames: { type: 'array', items: { type: 'string' }, description: 'Names of project items to move (all items matching a name are moved)' },
+        itemIds: { type: 'array', items: { type: 'number' }, description: 'IDs of project items to move' }
+      },
+      required: ['folderPath']
+    },
+    generator: generators.generateMoveProjectItems
+  },
+  {
     name: 'find_missing_footage',
     description: 'Find all missing footage items in the project',
     inputSchema: {
@@ -1149,8 +1328,101 @@ const TOOLS = [
       required: ['start', 'duration']
     },
     generator: generators.generateSetWorkArea
+  },
+
+  // ============================================
+  // BATCH TOOL
+  // ============================================
+  {
+    name: 'batch_execute',
+    description: 'Execute several MCP tool calls in a single round-trip to After Effects. Each step is any other tool name with its params (e.g. 10x modify_layer). Steps run in order; failures are reported per step without aborting the rest (unless stopOnError). Much faster than calling tools one by one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        steps: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              tool: { type: 'string', description: 'Name of the MCP tool to run' },
+              params: { type: 'object', description: 'Arguments for that tool' }
+            },
+            required: ['tool']
+          },
+          description: 'Ordered list of tool calls to run in one go'
+        },
+        stopOnError: { type: 'boolean', description: 'Stop at the first failing step (default: false, remaining steps still run)' }
+      },
+      required: ['steps']
+    },
+    generator: generateBatchExecute
   }
 ];
+
+/**
+ * Generate one ExtendScript that runs several tools' scripts in sequence.
+ * Each step's script is embedded as a string and eval'd so its completion
+ * value (the tool's result object) can be captured per step. Mutating steps
+ * keep their own sequential (not nested) undo groups.
+ */
+function generateBatchExecute(params: {
+  steps: Array<{ tool: string; params?: Record<string, unknown> }>;
+  stopOnError?: boolean;
+}): string {
+  if (!params.steps || !Array.isArray(params.steps) || params.steps.length === 0) {
+    throw new Error('steps must be a non-empty array');
+  }
+
+  const stepScripts: string[] = [];
+  const stepNames: string[] = [];
+  for (let i = 0; i < params.steps.length; i++) {
+    const step = params.steps[i];
+    if (step.tool === 'batch_execute') {
+      throw new Error('batch_execute cannot be nested (step ' + (i + 1) + ')');
+    }
+    const stepTool = toolMap.get(step.tool);
+    if (!stepTool) {
+      throw new Error('Unknown tool in batch step ' + (i + 1) + ': ' + step.tool);
+    }
+    if ((stepTool as any).returnsImage) {
+      throw new Error('Tool "' + step.tool + '" returns an image and cannot run in a batch (step ' + (i + 1) + ')');
+    }
+    stepScripts.push(stepTool.generator(step.params as any || {}));
+    stepNames.push(step.tool);
+  }
+
+  let script = '';
+  script += 'var __batchScripts = [';
+  script += stepScripts.map(s => '"' + escapeString(s) + '"').join(', ');
+  script += '];\n';
+  script += 'var __batchNames = [';
+  script += stepNames.map(n => '"' + escapeString(n) + '"').join(', ');
+  script += '];\n';
+  script += 'var __batchResults = [];\n';
+  script += 'var __batchFailed = 0;\n';
+  script += 'for (var __b = 0; __b < __batchScripts.length; __b++) {\n';
+  script += '  try {\n';
+  script += '    var __stepResult = eval(__batchScripts[__b]);\n';
+  script += '    __batchResults.push({ step: __b + 1, tool: __batchNames[__b], success: true, data: __stepResult });\n';
+  script += '  } catch (__err) {\n';
+  script += '    __batchFailed++;\n';
+  script += '    __batchResults.push({ step: __b + 1, tool: __batchNames[__b], success: false, error: __err.toString() });\n';
+  if (params.stopOnError) {
+    script += '    break;\n';
+  }
+  script += '  }\n';
+  script += '}\n';
+  script += 'var result = {\n';
+  script += '  success: __batchFailed === 0,\n';
+  script += '  stepCount: __batchScripts.length,\n';
+  script += '  executedCount: __batchResults.length,\n';
+  script += '  failedCount: __batchFailed,\n';
+  script += '  results: __batchResults\n';
+  script += '};\n';
+  script += 'result;\n';
+
+  return script;
+}
 
 // Create tool lookup map
 const toolMap = new Map<string, typeof TOOLS[0]>();
@@ -1185,6 +1457,96 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+/**
+ * Wait for a file to exist with a stable, non-zero size (two consecutive
+ * identical size readings), so we never read a partially written frame.
+ */
+async function waitForFile(filePath: string, timeoutMs: number): Promise<void> {
+  const start = Date.now();
+  let lastSize = -1;
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const stats = await fs.promises.stat(filePath);
+      if (stats.size > 0 && stats.size === lastSize) {
+        return;
+      }
+      lastSize = stats.size;
+    } catch {
+      // File not there yet
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  throw new Error(
+    `Frame file was not written within ${timeoutMs}ms: ${filePath}. ` +
+    'The composition may be too heavy to render, or saveFrameToPng failed silently.'
+  );
+}
+
+/**
+ * Execute a tool that returns an image: render to a temp PNG in After Effects,
+ * then read, downscale, and return it as an MCP image content block.
+ */
+async function executeImageTool(tool: typeof TOOLS[0], args: Record<string, any>) {
+  const tempPath = path
+    .join(os.tmpdir(), `ae-mcp-frame-${Date.now()}-${Math.random().toString(36).substring(2, 8)}.png`)
+    .replace(/\\/g, '/');
+
+  const script = tool.generator({ ...args, outputPath: tempPath } as any);
+  const result = await communicator.executeScript(script);
+
+  if (!result.success) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result)
+        }
+      ],
+      isError: true
+    };
+  }
+
+  try {
+    // saveFrameToPng returns before the PNG is written; wait for the file to land
+    await waitForFile(tempPath, 30000);
+
+    const maxSize = typeof args.maxSize === 'number'
+      ? Math.max(64, Math.min(2048, Math.round(args.maxSize)))
+      : 1024;
+    const usePng = args.format === 'png';
+
+    const resized = sharp(tempPath).resize({
+      width: maxSize,
+      height: maxSize,
+      fit: 'inside',
+      withoutEnlargement: true
+    });
+
+    const buffer = usePng
+      ? await resized.png().toBuffer()
+      : await resized.flatten({ background: '#000000' }).jpeg({ quality: 80 }).toBuffer();
+
+    return {
+      content: [
+        {
+          type: 'image',
+          data: buffer.toString('base64'),
+          mimeType: usePng ? 'image/png' : 'image/jpeg'
+        },
+        {
+          type: 'text',
+          text: JSON.stringify({ success: true, data: result.data, executionTime: result.executionTime })
+        }
+      ],
+      isError: false
+    };
+  } finally {
+    fs.promises.unlink(tempPath).catch(() => {});
+  }
+}
+
 // Call tool handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -1203,6 +1565,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   try {
+    // Image tools render to a temp file and return the image itself
+    if ((tool as any).returnsImage) {
+      return await executeImageTool(tool, (args as any) || {});
+    }
+
     // Generate the script
     const script = tool.generator(args as any || {});
 
