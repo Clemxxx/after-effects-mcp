@@ -44,6 +44,8 @@ export {
   generateCopyLayers,
   generateReorderLayer,
   generateAlignLayers,
+  generateDistributeGroups,
+  generateCreateGroupController,
   generateGetTextStyles,
   generateSetTextStyleRange,
   generateSetTextContent,

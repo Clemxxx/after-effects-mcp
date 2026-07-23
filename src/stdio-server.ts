@@ -501,6 +501,63 @@ const TOOLS = [
     generator: generators.generateAlignLayers
   },
   {
+    name: 'distribute_groups',
+    description: 'Distribute GROUPS of layers along one axis, each group treated as ONE block (combined bounding box, all its members move together). Example: [title+subtitle] / [3 product images] / [CTA] stacked vertically. Two modes: fixed `spacing` in px between consecutive blocks (arrangement centered on the canvas by default, or anchored on the first block), or even distribution when spacing is omitted (first and last blocks stay in place, middle gaps are equalized — needs 3+ groups). Bounds account for anchor/scale/rotation/parenting; animated positions are shifted keyframe by keyframe.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        groups: {
+          type: 'array',
+          description: 'The groups to distribute, in any order. Each group is a set of layers moved as one block.',
+          items: {
+            type: 'object',
+            properties: {
+              layerNames: { type: 'array', items: { type: 'string' }, description: 'Layers of this group (by name)' },
+              layerIndices: { type: 'array', items: { type: 'number' }, description: 'Layers of this group (by 1-based index)' }
+            }
+          }
+        },
+        axis: { type: 'string', enum: ['horizontal', 'vertical'], description: 'Axis along which the groups are distributed' },
+        spacing: { type: 'number', description: 'Fixed gap in pixels between consecutive group boxes. Omit for even distribution (first/last groups stay, middle gaps equalize)' },
+        anchor: { type: 'string', enum: ['center', 'first'], description: 'With spacing: center (default) centers the whole arrangement on the canvas; first keeps the first group in place and stacks the others after it' },
+        order: { type: 'string', enum: ['position', 'given'], description: 'position (default): keep the groups\' current on-canvas order. given: use the order of the groups array (reorders them visually)' },
+        time: { type: 'number', description: 'Time in seconds at which bounds are measured (default: current comp time)' }
+      },
+      required: ['groups', 'axis']
+    },
+    generator: generators.generateDistributeGroups
+  },
+  {
+    name: 'create_group_controller',
+    description: 'Create a null layer that controls a set of layers as one rig: the null is placed at the center of their combined bounding box and every root layer is parented to it (visual positions are preserved — no jump). Afterwards, animate/modify the NULL\'s Scale to resize the whole arrangement (spacing scales proportionally), or its Position/Rotation to move/rotate everything together. Layers already parented to another selected layer keep their parent (the rig is preserved); layers parented to an outside layer are detached from it and reported in the result.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        layerNames: { type: 'array', items: { type: 'string' }, description: 'Layers to control (by name)' },
+        layerIndices: { type: 'array', items: { type: 'number' }, description: 'Layers to control (by 1-based index)' },
+        groups: {
+          type: 'array',
+          description: 'Alternative to layerNames/layerIndices: same group structure as distribute_groups (all groups are controlled by the one null)',
+          items: {
+            type: 'object',
+            properties: {
+              layerNames: { type: 'array', items: { type: 'string' } },
+              layerIndices: { type: 'array', items: { type: 'number' } }
+            }
+          }
+        },
+        nullName: { type: 'string', description: 'Name of the controller null (default "Group Controller")' },
+        position: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, description: 'Pivot position of the null (default: center of the combined bounding box — scaling then happens around the center)' },
+        time: { type: 'number', description: 'Time in seconds at which bounds are measured (default: current comp time)' }
+      }
+    },
+    generator: generators.generateCreateGroupController
+  },
+  {
     name: 'get_text_styles',
     description: 'Read the per-character formatting of a text layer as style runs (font, size, colors, faux bold/italic...). Detects mixed formatting within a single text block. Requires AE 24.3+.',
     inputSchema: {

@@ -934,6 +934,135 @@ export function generateReorderLayer(params: {
 }
 
 /**
+ * Emit the ES3 layer-to-comp geometry helpers shared by align_layers,
+ * distribute_groups and create_group_controller. Expects a `comp` variable
+ * and an `alignTime` variable to be defined before this block.
+ * `tool` prefixes the error messages so failures name the right MCP tool.
+ */
+function emitGeometryHelpers(tool: string): string {
+  let script = '';
+  // Layer-to-comp geometry: walk the parent chain applying anchor/scale/
+  // Z-rotation/position at each level (2D math; 3D X/Y rotations ignored).
+  script += 'var __d2r = Math.PI / 180;\n';
+  script += 'var __xf = function (lyr) {\n';
+  script += '  var tr = lyr.property("ADBE Transform Group");\n';
+  script += '  var a = tr.property("ADBE Anchor Point").valueAtTime(alignTime, false);\n';
+  script += '  var p = tr.property("ADBE Position").valueAtTime(alignTime, false);\n';
+  script += '  var s = tr.property("ADBE Scale").valueAtTime(alignTime, false);\n';
+  script += '  var rp = tr.property("ADBE Rotate Z");\n';
+  script += '  var r = rp ? rp.valueAtTime(alignTime, false) * __d2r : 0;\n';
+  script += '  return { ax: a[0], ay: a[1], px: p[0], py: p[1], sx: s[0] / 100, sy: s[1] / 100, r: r };\n';
+  script += '};\n';
+  script += 'var __toComp = function (lyr, x, y) {\n';
+  script += '  var cur = lyr;\n';
+  script += '  var px = x, py = y;\n';
+  script += '  while (cur) {\n';
+  script += '    var f = __xf(cur);\n';
+  script += '    var lx = (px - f.ax) * f.sx;\n';
+  script += '    var ly = (py - f.ay) * f.sy;\n';
+  script += '    var c = Math.cos(f.r), sn = Math.sin(f.r);\n';
+  script += '    px = f.px + lx * c - ly * sn;\n';
+  script += '    py = f.py + lx * sn + ly * c;\n';
+  script += '    cur = cur.parent;\n';
+  script += '  }\n';
+  script += '  return [px, py];\n';
+  script += '};\n';
+  // Inverse of the parent chain's linear part, to convert a comp-space
+  // delta into the layer's own position space (position lives in parent space).
+  script += 'var __compDeltaToParent = function (lyr, dx, dy) {\n';
+  script += '  var m00 = 1, m01 = 0, m10 = 0, m11 = 1;\n';
+  script += '  var cur = lyr.parent;\n';
+  script += '  while (cur) {\n';
+  script += '    var f = __xf(cur);\n';
+  script += '    var c = Math.cos(f.r), sn = Math.sin(f.r);\n';
+  script += '    var a00 = c * f.sx, a01 = -sn * f.sy;\n';
+  script += '    var a10 = sn * f.sx, a11 = c * f.sy;\n';
+  script += '    var n00 = a00 * m00 + a01 * m10;\n';
+  script += '    var n01 = a00 * m01 + a01 * m11;\n';
+  script += '    var n10 = a10 * m00 + a11 * m10;\n';
+  script += '    var n11 = a10 * m01 + a11 * m11;\n';
+  script += '    m00 = n00; m01 = n01; m10 = n10; m11 = n11;\n';
+  script += '    cur = cur.parent;\n';
+  script += '  }\n';
+  script += '  var det = m00 * m11 - m01 * m10;\n';
+  script += '  if (det > -1e-9 && det < 1e-9) {\n';
+  script += '    throw new Error("' + tool + ': layer " + lyr.name + " has a parent scaled to 0, cannot compute its move");\n';
+  script += '  }\n';
+  script += '  return [(m11 * dx - m01 * dy) / det, (m00 * dy - m10 * dx) / det];\n';
+  script += '};\n';
+  script += 'var __bounds = function (lyr) {\n';
+  script += '  var rect = null;\n';
+  script += '  try { rect = lyr.sourceRectAtTime(alignTime, false); } catch (eR) {}\n';
+  script += '  if (!rect && lyr.source) {\n';
+  script += '    rect = { left: 0, top: 0, width: lyr.source.width, height: lyr.source.height };\n';
+  script += '  }\n';
+  script += '  if (!rect) {\n';
+  script += '    throw new Error("' + tool + ': cannot measure the bounds of layer " + lyr.name);\n';
+  script += '  }\n';
+  script += '  var corners = [[rect.left, rect.top], [rect.left + rect.width, rect.top], [rect.left, rect.top + rect.height], [rect.left + rect.width, rect.top + rect.height]];\n';
+  script += '  var b = null;\n';
+  script += '  for (var cI = 0; cI < 4; cI++) {\n';
+  script += '    var pt = __toComp(lyr, corners[cI][0], corners[cI][1]);\n';
+  script += '    if (!b) {\n';
+  script += '      b = { minX: pt[0], minY: pt[1], maxX: pt[0], maxY: pt[1] };\n';
+  script += '    } else {\n';
+  script += '      if (pt[0] < b.minX) b.minX = pt[0];\n';
+  script += '      if (pt[1] < b.minY) b.minY = pt[1];\n';
+  script += '      if (pt[0] > b.maxX) b.maxX = pt[0];\n';
+  script += '      if (pt[1] > b.maxY) b.maxY = pt[1];\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  return b;\n';
+  script += '};\n';
+  script += 'var __unionBounds = function (a, b) {\n';
+  script += '  if (!a) return b;\n';
+  script += '  if (b.minX < a.minX) a.minX = b.minX;\n';
+  script += '  if (b.minY < a.minY) a.minY = b.minY;\n';
+  script += '  if (b.maxX > a.maxX) a.maxX = b.maxX;\n';
+  script += '  if (b.maxY > a.maxY) a.maxY = b.maxY;\n';
+  script += '  return a;\n';
+  script += '};\n';
+  return script;
+}
+
+/**
+ * Emit the ES3 helpers that move a layer by a comp-space delta, shifting
+ * every position keyframe (separated dimensions included). Requires the
+ * geometry helpers (emitGeometryHelpers) to be emitted first.
+ */
+function emitShiftHelpers(): string {
+  let script = '';
+  script += 'var __shiftDim = function (p, dd) {\n';
+  script += '  if (!p) return;\n';
+  script += '  if (p.numKeys > 0) {\n';
+  script += '    for (var kk = 1; kk <= p.numKeys; kk++) {\n';
+  script += '      p.setValueAtKey(kk, p.keyValue(kk) + dd);\n';
+  script += '    }\n';
+  script += '  } else {\n';
+  script += '    p.setValue(p.value + dd);\n';
+  script += '  }\n';
+  script += '};\n';
+  script += 'var __shift = function (lyr, dx, dy) {\n';
+  script += '  var dp = __compDeltaToParent(lyr, dx, dy);\n';
+  script += '  var tr = lyr.property("ADBE Transform Group");\n';
+  script += '  var posProp = tr.property("ADBE Position");\n';
+  script += '  if (posProp.dimensionsSeparated) {\n';
+  script += '    __shiftDim(tr.property("ADBE Position_0"), dp[0]);\n';
+  script += '    __shiftDim(tr.property("ADBE Position_1"), dp[1]);\n';
+  script += '  } else if (posProp.numKeys > 0) {\n';
+  script += '    for (var kk = 1; kk <= posProp.numKeys; kk++) {\n';
+  script += '      var kv = posProp.keyValue(kk);\n';
+  script += '      posProp.setValueAtKey(kk, kv.length > 2 ? [kv[0] + dp[0], kv[1] + dp[1], kv[2]] : [kv[0] + dp[0], kv[1] + dp[1]]);\n';
+  script += '    }\n';
+  script += '  } else {\n';
+  script += '    var pv = posProp.value;\n';
+  script += '    posProp.setValue(pv.length > 2 ? [pv[0] + dp[0], pv[1] + dp[1], pv[2]] : [pv[0] + dp[0], pv[1] + dp[1]]);\n';
+  script += '  }\n';
+  script += '};\n';
+  return script;
+}
+
+/**
  * Generate script to align layers to the composition canvas.
  * Default mode treats the whole selection as ONE group: the combined
  * bounding box is aligned and every layer moves by the same delta, so the
@@ -1017,87 +1146,7 @@ export function generateAlignLayers(params: {
 
   script += 'var alignTime = ' + (params.time !== undefined ? params.time : 'comp.time') + ';\n';
 
-  // Layer-to-comp geometry: walk the parent chain applying anchor/scale/
-  // Z-rotation/position at each level (2D math; 3D X/Y rotations ignored).
-  script += 'var __d2r = Math.PI / 180;\n';
-  script += 'var __xf = function (lyr) {\n';
-  script += '  var tr = lyr.property("ADBE Transform Group");\n';
-  script += '  var a = tr.property("ADBE Anchor Point").valueAtTime(alignTime, false);\n';
-  script += '  var p = tr.property("ADBE Position").valueAtTime(alignTime, false);\n';
-  script += '  var s = tr.property("ADBE Scale").valueAtTime(alignTime, false);\n';
-  script += '  var rp = tr.property("ADBE Rotate Z");\n';
-  script += '  var r = rp ? rp.valueAtTime(alignTime, false) * __d2r : 0;\n';
-  script += '  return { ax: a[0], ay: a[1], px: p[0], py: p[1], sx: s[0] / 100, sy: s[1] / 100, r: r };\n';
-  script += '};\n';
-  script += 'var __toComp = function (lyr, x, y) {\n';
-  script += '  var cur = lyr;\n';
-  script += '  var px = x, py = y;\n';
-  script += '  while (cur) {\n';
-  script += '    var f = __xf(cur);\n';
-  script += '    var lx = (px - f.ax) * f.sx;\n';
-  script += '    var ly = (py - f.ay) * f.sy;\n';
-  script += '    var c = Math.cos(f.r), sn = Math.sin(f.r);\n';
-  script += '    px = f.px + lx * c - ly * sn;\n';
-  script += '    py = f.py + lx * sn + ly * c;\n';
-  script += '    cur = cur.parent;\n';
-  script += '  }\n';
-  script += '  return [px, py];\n';
-  script += '};\n';
-  // Inverse of the parent chain's linear part, to convert a comp-space
-  // delta into the layer's own position space (position lives in parent space).
-  script += 'var __compDeltaToParent = function (lyr, dx, dy) {\n';
-  script += '  var m00 = 1, m01 = 0, m10 = 0, m11 = 1;\n';
-  script += '  var cur = lyr.parent;\n';
-  script += '  while (cur) {\n';
-  script += '    var f = __xf(cur);\n';
-  script += '    var c = Math.cos(f.r), sn = Math.sin(f.r);\n';
-  script += '    var a00 = c * f.sx, a01 = -sn * f.sy;\n';
-  script += '    var a10 = sn * f.sx, a11 = c * f.sy;\n';
-  script += '    var n00 = a00 * m00 + a01 * m10;\n';
-  script += '    var n01 = a00 * m01 + a01 * m11;\n';
-  script += '    var n10 = a10 * m00 + a11 * m10;\n';
-  script += '    var n11 = a10 * m01 + a11 * m11;\n';
-  script += '    m00 = n00; m01 = n01; m10 = n10; m11 = n11;\n';
-  script += '    cur = cur.parent;\n';
-  script += '  }\n';
-  script += '  var det = m00 * m11 - m01 * m10;\n';
-  script += '  if (det > -1e-9 && det < 1e-9) {\n';
-  script += '    throw new Error("align_layers: layer " + lyr.name + " has a parent scaled to 0, cannot compute its move");\n';
-  script += '  }\n';
-  script += '  return [(m11 * dx - m01 * dy) / det, (m00 * dy - m10 * dx) / det];\n';
-  script += '};\n';
-  script += 'var __bounds = function (lyr) {\n';
-  script += '  var rect = null;\n';
-  script += '  try { rect = lyr.sourceRectAtTime(alignTime, false); } catch (eR) {}\n';
-  script += '  if (!rect && lyr.source) {\n';
-  script += '    rect = { left: 0, top: 0, width: lyr.source.width, height: lyr.source.height };\n';
-  script += '  }\n';
-  script += '  if (!rect) {\n';
-  script += '    throw new Error("align_layers: cannot measure the bounds of layer " + lyr.name);\n';
-  script += '  }\n';
-  script += '  var corners = [[rect.left, rect.top], [rect.left + rect.width, rect.top], [rect.left, rect.top + rect.height], [rect.left + rect.width, rect.top + rect.height]];\n';
-  script += '  var b = null;\n';
-  script += '  for (var cI = 0; cI < 4; cI++) {\n';
-  script += '    var pt = __toComp(lyr, corners[cI][0], corners[cI][1]);\n';
-  script += '    if (!b) {\n';
-  script += '      b = { minX: pt[0], minY: pt[1], maxX: pt[0], maxY: pt[1] };\n';
-  script += '    } else {\n';
-  script += '      if (pt[0] < b.minX) b.minX = pt[0];\n';
-  script += '      if (pt[1] < b.minY) b.minY = pt[1];\n';
-  script += '      if (pt[0] > b.maxX) b.maxX = pt[0];\n';
-  script += '      if (pt[1] > b.maxY) b.maxY = pt[1];\n';
-  script += '    }\n';
-  script += '  }\n';
-  script += '  return b;\n';
-  script += '};\n';
-  script += 'var __unionBounds = function (a, b) {\n';
-  script += '  if (!a) return b;\n';
-  script += '  if (b.minX < a.minX) a.minX = b.minX;\n';
-  script += '  if (b.minY < a.minY) a.minY = b.minY;\n';
-  script += '  if (b.maxX > a.maxX) a.maxX = b.maxX;\n';
-  script += '  if (b.maxY > a.maxY) a.maxY = b.maxY;\n';
-  script += '  return a;\n';
-  script += '};\n';
+  script += emitGeometryHelpers('align_layers');
 
   // The comp-space delta that aligns a bounding box to the canvas.
   script += 'var __pad = ' + padding + ';\n';
@@ -1122,33 +1171,7 @@ export function generateAlignLayers(params: {
 
   // Apply a comp-space delta to a layer's Position, shifting every
   // keyframe when the position is animated (separated dimensions included).
-  script += 'var __shiftDim = function (p, dd) {\n';
-  script += '  if (!p) return;\n';
-  script += '  if (p.numKeys > 0) {\n';
-  script += '    for (var kk = 1; kk <= p.numKeys; kk++) {\n';
-  script += '      p.setValueAtKey(kk, p.keyValue(kk) + dd);\n';
-  script += '    }\n';
-  script += '  } else {\n';
-  script += '    p.setValue(p.value + dd);\n';
-  script += '  }\n';
-  script += '};\n';
-  script += 'var __shift = function (lyr, dx, dy) {\n';
-  script += '  var dp = __compDeltaToParent(lyr, dx, dy);\n';
-  script += '  var tr = lyr.property("ADBE Transform Group");\n';
-  script += '  var posProp = tr.property("ADBE Position");\n';
-  script += '  if (posProp.dimensionsSeparated) {\n';
-  script += '    __shiftDim(tr.property("ADBE Position_0"), dp[0]);\n';
-  script += '    __shiftDim(tr.property("ADBE Position_1"), dp[1]);\n';
-  script += '  } else if (posProp.numKeys > 0) {\n';
-  script += '    for (var kk = 1; kk <= posProp.numKeys; kk++) {\n';
-  script += '      var kv = posProp.keyValue(kk);\n';
-  script += '      posProp.setValueAtKey(kk, kv.length > 2 ? [kv[0] + dp[0], kv[1] + dp[1], kv[2]] : [kv[0] + dp[0], kv[1] + dp[1]]);\n';
-  script += '    }\n';
-  script += '  } else {\n';
-  script += '    var pv = posProp.value;\n';
-  script += '    posProp.setValue(pv.length > 2 ? [pv[0] + dp[0], pv[1] + dp[1], pv[2]] : [pv[0] + dp[0], pv[1] + dp[1]]);\n';
-  script += '  }\n';
-  script += '};\n';
+  script += emitShiftHelpers();
   // A selected layer parented (directly or not) to another selected layer
   // already follows its parent's move — moving it too would double the shift.
   script += 'var __hasSelectedAncestor = function (lyr) {\n';
@@ -1211,6 +1234,403 @@ export function generateAlignLayers(params: {
   });
 
   return wrapInUndoGroup(script, 'Align Layers');
+}
+
+/**
+ * Generate script to distribute GROUPS of layers along one axis.
+ * Each group (a set of layers) is treated as one block: its combined
+ * bounding box is measured and all its members move by the same delta.
+ * Two modes: fixed spacing between consecutive blocks, or even
+ * distribution (first and last blocks stay, middle gaps are equalized).
+ */
+export function generateDistributeGroups(params: {
+  compId?: number;
+  compName?: string;
+  groups: Array<{ layerNames?: string[]; layerIndices?: number[] }>;
+  axis: string;
+  spacing?: number;
+  anchor?: string;
+  order?: string;
+  time?: number;
+}): string {
+  if (!params.groups || params.groups.length < 2) {
+    throw new Error('distribute_groups needs at least 2 groups');
+  }
+  for (let gi = 0; gi < params.groups.length; gi++) {
+    const g = params.groups[gi];
+    const hasNames = g.layerNames && g.layerNames.length > 0;
+    const hasIdxs = g.layerIndices && g.layerIndices.length > 0;
+    if (!hasNames && !hasIdxs) {
+      throw new Error('distribute_groups: group ' + (gi + 1) + ' has no layerNames and no layerIndices');
+    }
+  }
+  const axis = params.axis;
+  if (axis !== 'horizontal' && axis !== 'vertical') {
+    throw new Error('axis must be "horizontal" or "vertical"');
+  }
+  if (params.spacing !== undefined && typeof params.spacing !== 'number') {
+    throw new Error('spacing must be a number (pixels between consecutive group boxes)');
+  }
+  if (params.spacing === undefined && params.groups.length < 3) {
+    throw new Error('even distribution (no spacing) needs at least 3 groups — with 2 groups pass an explicit spacing');
+  }
+  const anchor = params.anchor || 'center';
+  if (anchor !== 'center' && anchor !== 'first') {
+    throw new Error('anchor must be "center" or "first"');
+  }
+  const order = params.order || 'position';
+  if (order !== 'position' && order !== 'given') {
+    throw new Error('order must be "position" or "given"');
+  }
+  const minProp = axis === 'horizontal' ? 'minX' : 'minY';
+  const maxProp = axis === 'horizontal' ? 'maxX' : 'maxY';
+  const axisLen = axis === 'horizontal' ? 'comp.width' : 'comp.height';
+
+  let defsES3 = '[';
+  for (let gi = 0; gi < params.groups.length; gi++) {
+    const g = params.groups[gi];
+    defsES3 += (gi > 0 ? ', ' : '') + '{ x: ' + arrayToES3(g.layerIndices || []) + ', n: ' + arrayToES3(g.layerNames || []) + ' }';
+  }
+  defsES3 += ']';
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+
+  script += 'var groupDefs = ' + defsES3 + ';\n';
+  script += 'var groups = [];\n';
+  script += 'var notFound = [];\n';
+  script += 'for (var gi = 0; gi < groupDefs.length; gi++) {\n';
+  script += '  var arr = [];\n';
+  script += '  var gd = groupDefs[gi];\n';
+  script += '  for (var d = 0; d < gd.x.length; d++) {\n';
+  script += '    if (gd.x[d] >= 1 && gd.x[d] <= comp.numLayers) {\n';
+  script += '      arr.push(comp.layer(gd.x[d]));\n';
+  script += '    } else {\n';
+  script += '      notFound.push("group " + (gi + 1) + " index:" + gd.x[d]);\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  for (var n = 0; n < gd.n.length; n++) {\n';
+  script += '    var matched = false;\n';
+  script += '    for (var i = 1; i <= comp.numLayers; i++) {\n';
+  script += '      if (comp.layer(i).name === gd.n[n]) {\n';
+  script += '        arr.push(comp.layer(i));\n';
+  script += '        matched = true;\n';
+  script += '      }\n';
+  script += '    }\n';
+  script += '    if (!matched) {\n';
+  script += '      notFound.push("group " + (gi + 1) + " " + gd.n[n]);\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  groups.push(arr);\n';
+  script += '}\n';
+  script += 'if (notFound.length > 0) {\n';
+  script += '  throw new Error("distribute_groups: layers not found: " + notFound.join(", "));\n';
+  script += '}\n';
+  script += 'for (var gc = 0; gc < groups.length; gc++) {\n';
+  script += '  if (groups[gc].length === 0) {\n';
+  script += '    throw new Error("distribute_groups: group " + (gc + 1) + " is empty");\n';
+  script += '  }\n';
+  script += '  for (var cl = 0; cl < groups[gc].length; cl++) {\n';
+  script += '    if (groups[gc][cl] instanceof CameraLayer || groups[gc][cl] instanceof LightLayer) {\n';
+  script += '      throw new Error("distribute_groups: layer " + groups[gc][cl].name + " is a camera/light and has no bounds");\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += 'var alignTime = ' + (params.time !== undefined ? params.time : 'comp.time') + ';\n';
+  script += emitGeometryHelpers('distribute_groups');
+  script += emitShiftHelpers();
+
+  // One bounding box per group, then reduce to a scalar (min + size) on the axis.
+  script += 'var boxes = [];\n';
+  script += 'for (var bb = 0; bb < groups.length; bb++) {\n';
+  script += '  var union = null;\n';
+  script += '  for (var bm = 0; bm < groups[bb].length; bm++) {\n';
+  script += '    union = __unionBounds(union, __bounds(groups[bb][bm]));\n';
+  script += '  }\n';
+  script += '  boxes.push(union);\n';
+  script += '}\n';
+  script += 'var mins = [], sizes = [];\n';
+  script += 'for (var bx = 0; bx < boxes.length; bx++) {\n';
+  script += '  mins.push(boxes[bx].' + minProp + ');\n';
+  script += '  sizes.push(boxes[bx].' + maxProp + ' - boxes[bx].' + minProp + ');\n';
+  script += '}\n';
+
+  script += 'var order = [];\n';
+  script += 'for (var oi = 0; oi < groups.length; oi++) { order.push(oi); }\n';
+  if (order === 'position') {
+    // Process groups in their current on-canvas order so spacing does not reshuffle them.
+    script += 'order.sort(function (a, b) { return (mins[a] + sizes[a] / 2) - (mins[b] + sizes[b] / 2); });\n';
+  }
+
+  script += 'var deltas = [];\n';
+  script += 'for (var dz = 0; dz < groups.length; dz++) { deltas.push(0); }\n';
+  if (params.spacing !== undefined) {
+    script += 'var __gap = ' + params.spacing + ';\n';
+    script += 'var totalSize = 0;\n';
+    script += 'for (var ts = 0; ts < order.length; ts++) { totalSize += sizes[order[ts]]; }\n';
+    script += 'var span = totalSize + __gap * (order.length - 1);\n';
+    if (anchor === 'center') {
+      script += 'var cursor = (' + axisLen + ' - span) / 2;\n';
+    } else {
+      script += 'var cursor = mins[order[0]];\n';
+    }
+    script += 'for (var pl = 0; pl < order.length; pl++) {\n';
+    script += '  deltas[order[pl]] = cursor - mins[order[pl]];\n';
+    script += '  cursor += sizes[order[pl]] + __gap;\n';
+    script += '}\n';
+  } else {
+    // Even distribution: first and last blocks stay put, middle gaps equalize.
+    script += 'var first = order[0], last = order[order.length - 1];\n';
+    script += 'var middleSum = 0;\n';
+    script += 'for (var ms = 1; ms < order.length - 1; ms++) { middleSum += sizes[order[ms]]; }\n';
+    script += 'var avail = mins[last] - (mins[first] + sizes[first]);\n';
+    script += 'var __gap = (avail - middleSum) / (order.length - 1);\n';
+    script += 'var cursor = mins[first] + sizes[first] + __gap;\n';
+    script += 'for (var pl = 1; pl < order.length - 1; pl++) {\n';
+    script += '  deltas[order[pl]] = cursor - mins[order[pl]];\n';
+    script += '  cursor += sizes[order[pl]] + __gap;\n';
+    script += '}\n';
+  }
+
+  // Flatten to unique layers (a layer listed twice moves once), remembering
+  // which group each belongs to so parented selections shift correctly.
+  script += 'var flatL = [], flatG = [];\n';
+  script += 'for (var fg = 0; fg < groups.length; fg++) {\n';
+  script += '  for (var fm = 0; fm < groups[fg].length; fm++) {\n';
+  script += '    var dup = false;\n';
+  script += '    for (var fq = 0; fq < flatL.length; fq++) {\n';
+  script += '      if (flatL[fq].index === groups[fg][fm].index) { dup = true; break; }\n';
+  script += '    }\n';
+  script += '    if (!dup) { flatL.push(groups[fg][fm]); flatG.push(fg); }\n';
+  script += '  }\n';
+  script += '}\n';
+  script += 'var __groupOf = function (lyr) {\n';
+  script += '  for (var q = 0; q < flatL.length; q++) {\n';
+  script += '    if (flatL[q].index === lyr.index) return flatG[q];\n';
+  script += '  }\n';
+  script += '  return -1;\n';
+  script += '};\n';
+  script += 'var __nearestSelGroup = function (lyr) {\n';
+  script += '  var cur = lyr.parent;\n';
+  script += '  while (cur) {\n';
+  script += '    var g = __groupOf(cur);\n';
+  script += '    if (g >= 0) return g;\n';
+  script += '    cur = cur.parent;\n';
+  script += '  }\n';
+  script += '  return -1;\n';
+  script += '};\n';
+
+  script += 'var relockList = [];\n';
+  script += 'for (var lk = 0; lk < flatL.length; lk++) {\n';
+  script += '  if (flatL[lk].locked) {\n';
+  script += '    flatL[lk].locked = false;\n';
+  script += '    relockList.push(flatL[lk]);\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += 'var movedNames = [];\n';
+  script += 'try {\n';
+  script += '  for (var mv = 0; mv < flatL.length; mv++) {\n';
+  script += '    var eff = deltas[flatG[mv]];\n';
+  // A parent selected in another group already carries its own group's move;
+  // only the residual is applied so the child lands on ITS group's target.
+  script += '    var anc = __nearestSelGroup(flatL[mv]);\n';
+  script += '    if (anc >= 0) { eff -= deltas[anc]; }\n';
+  script += '    if (eff !== 0) {\n';
+  if (axis === 'horizontal') {
+    script += '      __shift(flatL[mv], eff, 0);\n';
+  } else {
+    script += '      __shift(flatL[mv], 0, eff);\n';
+  }
+  script += '    }\n';
+  script += '    movedNames.push(flatL[mv].name);\n';
+  script += '  }\n';
+  script += '} finally {\n';
+  script += '  for (var r = 0; r < relockList.length; r++) {\n';
+  script += '    relockList[r].locked = true;\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += 'var deltasOut = [];\n';
+  script += 'for (var ro = 0; ro < deltas.length; ro++) { deltasOut.push(Math.round(deltas[ro] * 100) / 100); }\n';
+
+  script += generateResultObject({
+    success: 'true',
+    axis: '"' + axis + '"',
+    mode: '"' + (params.spacing !== undefined ? 'spacing' : 'even') + '"',
+    gap: 'Math.round(__gap * 100) / 100',
+    groupDeltas: 'deltasOut',
+    movedLayers: 'movedNames'
+  });
+
+  return wrapInUndoGroup(script, 'Distribute Groups');
+}
+
+/**
+ * Generate script to create a null that controls a set of layers as one rig.
+ * The null is placed at the center of the combined bounding box and every
+ * root layer of the selection is parented to it (AE preserves the visual
+ * position when parenting). Scaling/moving/rotating the null then transforms
+ * the whole arrangement, keeping the relative distances proportional.
+ */
+export function generateCreateGroupController(params: {
+  compId?: number;
+  compName?: string;
+  groups?: Array<{ layerNames?: string[]; layerIndices?: number[] }>;
+  layerNames?: string[];
+  layerIndices?: number[];
+  nullName?: string;
+  position?: { x: number; y: number };
+  time?: number;
+}): string {
+  const names: string[] = (params.layerNames || []).slice();
+  const idxs: number[] = (params.layerIndices || []).slice();
+  if (params.groups) {
+    for (const g of params.groups) {
+      if (g.layerNames) names.push(...g.layerNames);
+      if (g.layerIndices) idxs.push(...g.layerIndices);
+    }
+  }
+  if (names.length === 0 && idxs.length === 0) {
+    throw new Error('create_group_controller needs layers (layerNames, layerIndices and/or groups)');
+  }
+  const nullName = params.nullName || 'Group Controller';
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+
+  script += 'var layersToControl = [];\n';
+  script += 'var notFound = [];\n';
+
+  if (idxs.length > 0) {
+    script += 'var idxs = ' + arrayToES3(idxs) + ';\n';
+    script += 'for (var d = 0; d < idxs.length; d++) {\n';
+    script += '  if (idxs[d] >= 1 && idxs[d] <= comp.numLayers) {\n';
+    script += '    layersToControl.push(comp.layer(idxs[d]));\n';
+    script += '  } else {\n';
+    script += '    notFound.push("index:" + idxs[d]);\n';
+    script += '  }\n';
+    script += '}\n';
+  }
+
+  if (names.length > 0) {
+    script += 'var names = ' + arrayToES3(names) + ';\n';
+    script += 'for (var n = 0; n < names.length; n++) {\n';
+    script += '  var matched = false;\n';
+    script += '  for (var i = 1; i <= comp.numLayers; i++) {\n';
+    script += '    if (comp.layer(i).name === names[n]) {\n';
+    script += '      layersToControl.push(comp.layer(i));\n';
+    script += '      matched = true;\n';
+    script += '    }\n';
+    script += '  }\n';
+    script += '  if (!matched) {\n';
+    script += '    notFound.push(names[n]);\n';
+    script += '  }\n';
+    script += '}\n';
+  }
+
+  script += 'if (notFound.length > 0) {\n';
+  script += '  throw new Error("create_group_controller: layers not found: " + notFound.join(", "));\n';
+  script += '}\n';
+  // Dedupe: a layer listed in several groups must be parented only once.
+  script += 'var uniq = [];\n';
+  script += 'for (var u = 0; u < layersToControl.length; u++) {\n';
+  script += '  var dup = false;\n';
+  script += '  for (var uq = 0; uq < uniq.length; uq++) {\n';
+  script += '    if (uniq[uq].index === layersToControl[u].index) { dup = true; break; }\n';
+  script += '  }\n';
+  script += '  if (!dup) { uniq.push(layersToControl[u]); }\n';
+  script += '}\n';
+  script += 'layersToControl = uniq;\n';
+  script += 'for (var cl = 0; cl < layersToControl.length; cl++) {\n';
+  script += '  if (layersToControl[cl] instanceof CameraLayer || layersToControl[cl] instanceof LightLayer) {\n';
+  script += '    throw new Error("create_group_controller: layer " + layersToControl[cl].name + " is a camera/light and has no bounds");\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += 'var alignTime = ' + (params.time !== undefined ? params.time : 'comp.time') + ';\n';
+  script += emitGeometryHelpers('create_group_controller');
+
+  script += 'var union = null;\n';
+  script += 'for (var bb = 0; bb < layersToControl.length; bb++) {\n';
+  script += '  union = __unionBounds(union, __bounds(layersToControl[bb]));\n';
+  script += '}\n';
+  if (params.position) {
+    script += 'var cx = ' + params.position.x + ';\n';
+    script += 'var cy = ' + params.position.y + ';\n';
+  } else {
+    script += 'var cx = (union.minX + union.maxX) / 2;\n';
+    script += 'var cy = (union.minY + union.maxY) / 2;\n';
+  }
+
+  // Null anchor sits at its position in comp space, so putting the null at
+  // the bbox center makes it the pivot: scaling it later resizes the whole
+  // arrangement around the center, gaps included, proportionally.
+  script += 'var ctrl = comp.layers.addNull(comp.duration);\n';
+  script += 'ctrl.name = "' + escapeString(nullName) + '";\n';
+  script += 'ctrl.startTime = 0;\n';
+  script += 'if (ctrl.index !== 1) {\n';
+  script += '  ctrl.moveToBeginning();\n';
+  script += '}\n';
+  script += 'ctrl.property("ADBE Transform Group").property("ADBE Position").setValue([cx, cy]);\n';
+
+  // A layer whose ancestor is also selected already follows the rig through
+  // its parent; re-parenting it to the null would break the existing rig.
+  script += 'var __hasControlledAncestor = function (lyr) {\n';
+  script += '  var cur = lyr.parent;\n';
+  script += '  while (cur) {\n';
+  script += '    for (var q = 0; q < layersToControl.length; q++) {\n';
+  script += '      if (layersToControl[q].index === cur.index) return true;\n';
+  script += '    }\n';
+  script += '    cur = cur.parent;\n';
+  script += '  }\n';
+  script += '  return false;\n';
+  script += '};\n';
+
+  script += 'var relockList = [];\n';
+  script += 'for (var lk = 0; lk < layersToControl.length; lk++) {\n';
+  script += '  if (layersToControl[lk].locked) {\n';
+  script += '    layersToControl[lk].locked = false;\n';
+  script += '    relockList.push(layersToControl[lk]);\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += 'var controlled = [];\n';
+  script += 'var childrenSkipped = [];\n';
+  script += 'var reparented = [];\n';
+  script += 'try {\n';
+  script += '  for (var mv = 0; mv < layersToControl.length; mv++) {\n';
+  script += '    if (__hasControlledAncestor(layersToControl[mv])) {\n';
+  script += '      childrenSkipped.push(layersToControl[mv].name);\n';
+  script += '      continue;\n';
+  script += '    }\n';
+  script += '    if (layersToControl[mv].parent) {\n';
+  script += '      reparented.push(layersToControl[mv].name + " (was under " + layersToControl[mv].parent.name + ")");\n';
+  script += '    }\n';
+  // Assigning .parent keeps the layer's world position (no visual jump).
+  script += '    layersToControl[mv].parent = ctrl;\n';
+  script += '    controlled.push(layersToControl[mv].name);\n';
+  script += '  }\n';
+  script += '} finally {\n';
+  script += '  for (var r = 0; r < relockList.length; r++) {\n';
+  script += '    relockList[r].locked = true;\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += generateResultObject({
+    success: 'true',
+    nullName: 'ctrl.name',
+    nullIndex: 'ctrl.index',
+    position: '[Math.round(cx * 100) / 100, Math.round(cy * 100) / 100]',
+    controlledLayers: 'controlled',
+    childrenFollowingTheirParent: 'childrenSkipped',
+    detachedFromPreviousParent: 'reparented'
+  });
+
+  return wrapInUndoGroup(script, 'Create Group Controller');
 }
 
 /**
