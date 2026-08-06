@@ -403,7 +403,7 @@ const TOOLS = [
   },
   {
     name: 'modify_layer',
-    description: 'Modify layer properties',
+    description: 'Modify layer properties. startTime performs a RIGID MOVE like dragging the layer bar in the timeline: all keyframes (transforms, effects, text animators, markers, time remap) move with the layer — use it to retime a layer without breaking its in/out animations. inPoint/outPoint are pure trims and never move keyframes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -416,9 +416,10 @@ const TOOLS = [
         solo: { type: 'boolean' },
         shy: { type: 'boolean' },
         locked: { type: 'boolean' },
-        inPoint: { type: 'number' },
-        outPoint: { type: 'number' },
-        startTime: { type: 'number' },
+        inPoint: { type: 'number', description: 'Trim only — does not move keyframes' },
+        outPoint: { type: 'number', description: 'Trim only — does not move keyframes' },
+        startTime: { type: 'number', description: 'Rigid move: shifts the layer AND all its keyframes by the same delta (like dragging in the timeline). Result reports keyframesShifted/skippedProperties.' },
+        shiftKeyframes: { type: 'boolean', description: 'Set false to change startTime WITHOUT moving keyframes (legacy behavior). Default true.' },
         stretch: { type: 'number' },
         blendMode: { type: 'string' },
         parent: { type: 'number' },
@@ -589,7 +590,7 @@ const TOOLS = [
   },
   {
     name: 'set_text_style_range',
-    description: 'Apply a style (font, size, color, faux bold/italic, tracking) to a character range inside a text layer, preserving the rest of the formatting — e.g. make one word bold italic. Select the range with matchText (first occurrence) or startIndex/endIndex. Requires AE 24.3+.',
+    description: 'Apply a style (font, size, color, faux bold/italic, tracking, baseline shift, leading) to a character range inside a text layer, preserving the rest of the formatting — e.g. make one word bold italic, or turn an asterisk into a superscript. Select the range with matchText (first occurrence) or startIndex/endIndex. Requires AE 24.3+.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -607,7 +608,9 @@ const TOOLS = [
         fillColor: { type: 'object', properties: { r: { type: 'number' }, g: { type: 'number' }, b: { type: 'number' } }, description: 'RGB 0-1' },
         fauxBold: { type: 'boolean' },
         fauxItalic: { type: 'boolean' },
-        tracking: { type: 'number' }
+        tracking: { type: 'number' },
+        baselineShift: { type: 'number', description: 'Vertical offset in px, positive = up. For a superscript, combine a smaller fontSize with a shift of ~30-50% of the base font size.' },
+        leading: { type: 'number', description: 'Line height in px of the lines containing the range. Note: disables auto-leading on the whole layer (other lines keep their current computed leading).' }
       }
     },
     generator: generators.generateSetTextStyleRange
@@ -624,6 +627,28 @@ const TOOLS = [
       }
     },
     generator: generators.generateListLayers
+  },
+  {
+    name: 'lint_timeline',
+    description: 'Audit a composition timeline for visual coverage problems, in one read-only call: GAPS (periods where no content layer is visible — blank screen), OVERLAPS (2+ content layers visible at once) and FADE anomalies (hard-cut: fade-out keys continue past outPoint so the layer is cut while still visible; invisible-tail/head: opacity sits at 0 inside the layer trim; invisible: never visible at all). Visibility accounts for opacity keyframes, so a layer only counts while actually visible. Camera, light, null, guide, adjustment, audio-only, disabled and statically-transparent layers are ignored automatically; pass excludeLayers for permanent layers (background, header/footer, watermark...). Each gap reports the layers ending just before (endsBefore) and starting just after (startsAfter) so it can be fixed with one targeted modify_layer.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        rangeStart: { type: 'number', description: 'Audit start in seconds (default 0)' },
+        rangeEnd: { type: 'number', description: 'Audit end in seconds (default comp duration)' },
+        excludeLayers: { type: 'array', items: {}, description: 'Layer names (strings) or indices (numbers) to ignore — permanent BG, header/footer, music beds...' },
+        minGapDuration: { type: 'number', description: 'Only report gaps and invisible holds longer than this, in seconds (default 0.1)' },
+        minOverlapDuration: { type: 'number', description: 'Only report overlaps longer than this, in seconds (default: 1 frame). Raise to ~0.6 to ignore intentional crossfades.' },
+        opacityThreshold: { type: 'number', description: 'Opacity percentage under which a layer counts as invisible (default 1)' },
+        checkGaps: { type: 'boolean', description: 'Default true' },
+        checkOverlaps: { type: 'boolean', description: 'Default true' },
+        checkFades: { type: 'boolean', description: 'Report hard-cut / invisible-head / invisible-tail anomalies (default true)' },
+        checkOpacity: { type: 'boolean', description: 'Refine visibility using opacity keyframes (default true). Set false for a purely structural in/out audit.' }
+      }
+    },
+    generator: generators.generateLintTimeline
   },
   {
     name: 'get_layer_info',

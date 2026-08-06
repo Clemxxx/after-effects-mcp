@@ -50,6 +50,7 @@ export {
   generateSetTextStyleRange,
   generateSetTextContent,
   generateListLayers,
+  generateLintTimeline,
   generateGetLayerInfo
 } from './generators/layerGenerators.js';
 

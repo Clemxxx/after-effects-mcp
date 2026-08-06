@@ -524,6 +524,109 @@ export function generatePrecomposeLayers(params: {
 /**
  * Generate script to modify layer properties
  */
+// ES3 helpers for the rigid move performed by modify_layer's startTime: shift
+// every keyframe of the layer (all properties recursively — transforms, effects,
+// text animators, masks, markers, time remap) by the same delta, preserving
+// value, interpolation type, temporal ease, spatial tangents, auto-bezier flags
+// and roving. Capture happens entirely before removal, so a property whose keys
+// cannot be read (custom value types like curves) is skipped with its keys intact.
+const SHIFT_KEYFRAMES_HELPERS =
+  'function __shiftPropKeys(prop, delta) {\n' +
+  '  var n = prop.numKeys;\n' +
+  '  var spatial = false;\n' +
+  '  try {\n' +
+  '    spatial = (prop.propertyValueType === PropertyValueType.TwoD_SPATIAL || prop.propertyValueType === PropertyValueType.ThreeD_SPATIAL);\n' +
+  '  } catch (e0) {}\n' +
+  '  var data = [];\n' +
+  '  for (var i = 1; i <= n; i++) {\n' +
+  '    var d = { time: prop.keyTime(i), value: prop.keyValue(i) };\n' +
+  '    try {\n' +
+  '      d.inType = prop.keyInInterpolationType(i);\n' +
+  '      d.outType = prop.keyOutInterpolationType(i);\n' +
+  '      d.inEase = prop.keyInTemporalEase(i);\n' +
+  '      d.outEase = prop.keyOutTemporalEase(i);\n' +
+  '      d.tCont = prop.keyTemporalContinuous(i);\n' +
+  '      d.tAuto = prop.keyTemporalAutoBezier(i);\n' +
+  '      d.roving = prop.keyRoving(i);\n' +
+  '      d.hasTemporal = true;\n' +
+  '    } catch (e1) { d.hasTemporal = false; }\n' +
+  '    if (spatial) {\n' +
+  '      try {\n' +
+  '        d.inTan = prop.keyInSpatialTangent(i);\n' +
+  '        d.outTan = prop.keyOutSpatialTangent(i);\n' +
+  '        d.sCont = prop.keySpatialContinuous(i);\n' +
+  '        d.sAuto = prop.keySpatialAutoBezier(i);\n' +
+  '        d.hasSpatial = true;\n' +
+  '      } catch (e2) { d.hasSpatial = false; }\n' +
+  '    }\n' +
+  '    data.push(d);\n' +
+  '  }\n' +
+  '  while (prop.numKeys > 0) { prop.removeKey(1); }\n' +
+  '  for (var j = 0; j < data.length; j++) {\n' +
+  '    prop.setValueAtTime(data[j].time + delta, data[j].value);\n' +
+  '  }\n' +
+  '  for (var j = 0; j < data.length; j++) {\n' +
+  '    var k = j + 1;\n' +
+  '    var d = data[j];\n' +
+  '    if (d.hasTemporal) {\n' +
+  '      try {\n' +
+  '        prop.setInterpolationTypeAtKey(k, d.inType, d.outType);\n' +
+  '        prop.setTemporalEaseAtKey(k, d.inEase, d.outEase);\n' +
+  '        prop.setTemporalContinuousAtKey(k, d.tCont);\n' +
+  '        prop.setTemporalAutoBezierAtKey(k, d.tAuto);\n' +
+  '      } catch (e3) {}\n' +
+  '    }\n' +
+  '    if (d.hasSpatial) {\n' +
+  // Auto-bezier tangents are recomputed by AE; setting them explicitly would
+  // flip the key to manual, so only restore tangents on manual keys
+  '      try {\n' +
+  '        if (d.sAuto) {\n' +
+  '          prop.setSpatialAutoBezierAtKey(k, true);\n' +
+  '        } else {\n' +
+  '          prop.setSpatialTangentsAtKey(k, d.inTan, d.outTan);\n' +
+  '          prop.setSpatialContinuousAtKey(k, d.sCont);\n' +
+  '        }\n' +
+  '      } catch (e4) {}\n' +
+  '    }\n' +
+  '  }\n' +
+  // Roving last: it needs its non-roving neighbours already in place
+  '  for (var j = 0; j < data.length; j++) {\n' +
+  '    if (data[j].hasTemporal && data[j].roving) {\n' +
+  '      try { prop.setRovingAtKey(j + 1, true); } catch (e5) {}\n' +
+  '    }\n' +
+  '  }\n' +
+  '  return n;\n' +
+  '}\n' +
+  'function __shiftGroupKeys(group, delta, stats) {\n' +
+  '  for (var i = 1; i <= group.numProperties; i++) {\n' +
+  '    var p = group.property(i);\n' +
+  '    if (p.propertyType === PropertyType.PROPERTY) {\n' +
+  '      if (p.numKeys > 0) {\n' +
+  '        try {\n' +
+  '          stats.keyframes += __shiftPropKeys(p, delta);\n' +
+  '          stats.properties++;\n' +
+  '        } catch (eP) {\n' +
+  '          stats.skipped.push(p.name);\n' +
+  '        }\n' +
+  '      }\n' +
+  '    } else {\n' +
+  '      __shiftGroupKeys(p, delta, stats);\n' +
+  '    }\n' +
+  '  }\n' +
+  '}\n' +
+  'function __findFirstKeyedProp(group) {\n' +
+  '  for (var i = 1; i <= group.numProperties; i++) {\n' +
+  '    var p = group.property(i);\n' +
+  '    if (p.propertyType === PropertyType.PROPERTY) {\n' +
+  '      if (p.numKeys > 0) { return p; }\n' +
+  '    } else {\n' +
+  '      var found = __findFirstKeyedProp(p);\n' +
+  '      if (found !== null) { return found; }\n' +
+  '    }\n' +
+  '  }\n' +
+  '  return null;\n' +
+  '}\n';
+
 export function generateModifyLayer(params: {
   compId?: number;
   compName?: string;
@@ -537,6 +640,7 @@ export function generateModifyLayer(params: {
   inPoint?: number;
   outPoint?: number;
   startTime?: number;
+  shiftKeyframes?: boolean;
   stretch?: number;
   blendMode?: string;
   parent?: number;
@@ -546,7 +650,11 @@ export function generateModifyLayer(params: {
   rotation?: number;
   opacity?: number;
 }): string {
+  const rigidMove = params.startTime !== undefined && params.shiftKeyframes !== false;
   let script = '';
+  if (rigidMove) {
+    script += SHIFT_KEYFRAMES_HELPERS;
+  }
   script += generateProjectCheck();
   script += generateCompAccess(params.compId, params.compName);
   script += generateLayerAccess('comp', params.layerIndex, params.layerName);
@@ -573,7 +681,21 @@ export function generateModifyLayer(params: {
     script += 'layer.outPoint = ' + params.outPoint + ';\n';
   }
   if (params.startTime !== undefined) {
-    script += 'layer.startTime = ' + params.startTime + ';\n';
+    if (rigidMove) {
+      script += 'var __shiftStats = { properties: 0, keyframes: 0, skipped: [] };\n';
+      script += 'var __delta = ' + params.startTime + ' - layer.startTime;\n';
+      // Probe one keyframe around the startTime assignment: if this AE version
+      // moves keyframes with startTime on its own, skip the manual shift
+      script += 'var __probe = __findFirstKeyedProp(layer);\n';
+      script += 'var __probeTime = (__probe !== null) ? __probe.keyTime(1) : 0;\n';
+      script += 'layer.startTime = ' + params.startTime + ';\n';
+      script += 'var __autoShifted = (__probe !== null) && (Math.abs((__probe.keyTime(1) - __probeTime) - __delta) < 0.0001);\n';
+      script += 'if (__delta !== 0 && !__autoShifted) {\n';
+      script += '  __shiftGroupKeys(layer, __delta, __shiftStats);\n';
+      script += '}\n';
+    } else {
+      script += 'layer.startTime = ' + params.startTime + ';\n';
+    }
   }
   if (params.stretch !== undefined) {
     script += 'layer.stretch = ' + params.stretch + ';\n';
@@ -604,10 +726,16 @@ export function generateModifyLayer(params: {
     script += 'layer.property("Opacity").setValue(' + params.opacity + ');\n';
   }
 
-  script += generateResultObject({
+  const resultFields: Record<string, string> = {
     index: 'layer.index',
     name: 'layer.name'
-  });
+  };
+  if (rigidMove) {
+    resultFields.keyframesShifted = '__shiftStats.keyframes';
+    resultFields.propertiesShifted = '__shiftStats.properties';
+    resultFields.skippedProperties = '__shiftStats.skipped';
+  }
+  script += generateResultObject(resultFields);
 
   return wrapInUndoGroup(script, 'Modify Layer');
 }
@@ -777,6 +905,8 @@ export function generateSetTextStyleRange(params: {
   fauxBold?: boolean;
   fauxItalic?: boolean;
   tracking?: number;
+  baselineShift?: number;
+  leading?: number;
 }): string {
   const hasIndexRange = params.startIndex !== undefined && params.endIndex !== undefined;
   if (!hasIndexRange && params.matchText === undefined) {
@@ -785,9 +915,10 @@ export function generateSetTextStyleRange(params: {
   const hasStyle = params.font !== undefined || params.fontFamily !== undefined ||
     params.fontSize !== undefined || params.fillColor !== undefined ||
     params.fauxBold !== undefined || params.fauxItalic !== undefined ||
-    params.tracking !== undefined;
+    params.tracking !== undefined || params.baselineShift !== undefined ||
+    params.leading !== undefined;
   if (!hasStyle) {
-    throw new Error('Provide at least one style property (font, fontFamily/fontStyle, fontSize, fillColor, fauxBold, fauxItalic, tracking)');
+    throw new Error('Provide at least one style property (font, fontFamily/fontStyle, fontSize, fillColor, fauxBold, fauxItalic, tracking, baselineShift, leading)');
   }
   if (params.fontFamily !== undefined && params.fontStyle === undefined) {
     throw new Error('fontFamily requires fontStyle (e.g. "Bold Italic"); alternatively use font with a PostScript name');
@@ -847,6 +978,15 @@ export function generateSetTextStyleRange(params: {
   }
   if (params.tracking !== undefined) {
     script += 'cr.tracking = ' + params.tracking + ';\n';
+  }
+  if (params.baselineShift !== undefined) {
+    script += 'cr.baselineShift = ' + params.baselineShift + ';\n';
+  }
+  if (params.leading !== undefined) {
+    // Leading is ignored while auto-leading is on; auto-leading is a
+    // layer-wide flag, so disabling it affects the whole text layer
+    script += 'textDoc.autoLeading = false;\n';
+    script += 'cr.leading = ' + params.leading + ';\n';
   }
 
   // Write the styled document back; since AE 24.3 setValue preserves
@@ -1885,6 +2025,227 @@ export function generateListLayers(params: {
   script += '  layers.push(entry);\n';
   script += '}\n';
   script += 'layers;\n';
+
+  return script;
+}
+
+/**
+ * Generate script to lint a composition timeline: report gaps (nothing visible),
+ * overlaps (2+ content layers visible at once) and fade anomalies (fade-out keys
+ * beyond outPoint = visible hard cut; opacity at 0 before outPoint = invisible
+ * hold). Visibility accounts for opacity keyframes: between two opacity keys the
+ * value is approximated linearly to find the crossing of the visibility
+ * threshold, so eased fades are located to within a fraction of a frame.
+ * Read-only — no undo group.
+ */
+export function generateLintTimeline(params: {
+  compId?: number;
+  compName?: string;
+  rangeStart?: number;
+  rangeEnd?: number;
+  excludeLayers?: (string | number)[];
+  minGapDuration?: number;
+  minOverlapDuration?: number;
+  opacityThreshold?: number;
+  checkGaps?: boolean;
+  checkOverlaps?: boolean;
+  checkFades?: boolean;
+  checkOpacity?: boolean;
+}): string {
+  const minGap = params.minGapDuration !== undefined ? params.minGapDuration : 0.1;
+  const opThr = params.opacityThreshold !== undefined ? params.opacityThreshold : 1;
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+
+  script += 'var frameDur = comp.frameDuration;\n';
+  script += 'var eps = frameDur / 2;\n';
+  script += 'var rangeStart = ' + (params.rangeStart !== undefined ? params.rangeStart : 0) + ';\n';
+  script += 'var rangeEnd = ' + (params.rangeEnd !== undefined ? params.rangeEnd : 'comp.duration') + ';\n';
+  script += 'var minGap = ' + minGap + ';\n';
+  script += 'var minOverlap = ' + (params.minOverlapDuration !== undefined ? params.minOverlapDuration : 'frameDur') + ';\n';
+  script += 'var opThr = ' + opThr + ';\n';
+  script += 'var checkGaps = ' + (params.checkGaps !== false) + ';\n';
+  script += 'var checkOverlaps = ' + (params.checkOverlaps !== false) + ';\n';
+  script += 'var checkFades = ' + (params.checkFades !== false) + ';\n';
+  script += 'var checkOpacity = ' + (params.checkOpacity !== false) + ';\n';
+
+  script += 'var __exName = {};\n';
+  script += 'var __exIdx = {};\n';
+  for (const ex of params.excludeLayers || []) {
+    if (typeof ex === 'number') {
+      script += '__exIdx[' + ex + '] = true;\n';
+    } else {
+      script += '__exName["' + escapeString(ex) + '"] = true;\n';
+    }
+  }
+
+  script += 'function __rt(t) { return Math.round(t * 1000) / 1000; }\n';
+  script += 'function __visSpans(op, s, e, thr) {\n';
+  script += '  var pts = [s];\n';
+  script += '  for (var k = 1; k <= op.numKeys; k++) {\n';
+  script += '    var kt = op.keyTime(k);\n';
+  script += '    if (kt > s && kt < e) { pts.push(kt); }\n';
+  script += '  }\n';
+  script += '  pts.push(e);\n';
+  script += '  var vals = [];\n';
+  script += '  for (var i = 0; i < pts.length; i++) { vals.push(op.valueAtTime(pts[i], false)); }\n';
+  script += '  var spans = [];\n';
+  script += '  var open = null;\n';
+  script += '  var lastEnd = 0;\n';
+  script += '  for (var i = 0; i < pts.length - 1; i++) {\n';
+  script += '    var t1 = pts[i]; var v1 = vals[i]; var t2 = pts[i + 1]; var v2 = vals[i + 1];\n';
+  script += '    var a = null; var b = null;\n';
+  script += '    if (v1 > thr && v2 > thr) { a = t1; b = t2; }\n';
+  script += '    else if (v1 > thr || v2 > thr) {\n';
+  script += '      var tc = t1 + ((thr - v1) / (v2 - v1)) * (t2 - t1);\n';
+  script += '      if (v1 > thr) { a = t1; b = tc; } else { a = tc; b = t2; }\n';
+  script += '    }\n';
+  script += '    if (a !== null) {\n';
+  script += '      if (open === null) { open = a; }\n';
+  script += '      else if (a - lastEnd > eps) { spans.push([open, lastEnd]); open = a; }\n';
+  script += '      lastEnd = b;\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  if (open !== null) { spans.push([open, lastEnd]); }\n';
+  script += '  return spans;\n';
+  script += '}\n';
+
+  script += 'var entries = [];\n';
+  script += 'var skipped = [];\n';
+  script += 'var issues = [];\n';
+  script += 'for (var li = 1; li <= comp.numLayers; li++) {\n';
+  script += '  var L = comp.layer(li);\n';
+  script += '  var reason = null;\n';
+  script += '  if (__exName[L.name] === true || __exIdx[li] === true) { reason = "excluded"; }\n';
+  script += '  else if (L instanceof CameraLayer) { reason = "camera"; }\n';
+  script += '  else if (L instanceof LightLayer) { reason = "light"; }\n';
+  script += '  else if (!L.enabled) { reason = "disabled"; }\n';
+  script += '  else if (L.guideLayer) { reason = "guide"; }\n';
+  script += '  else if (L.nullLayer) { reason = "null"; }\n';
+  script += '  else if (L.adjustmentLayer) { reason = "adjustment"; }\n';
+  script += '  else if (!L.hasVideo) { reason = "audio"; }\n';
+  script += '  if (reason !== null) {\n';
+  script += '    skipped.push({ index: li, name: L.name, reason: reason });\n';
+  script += '    continue;\n';
+  script += '  }\n';
+  script += '  var s = Math.max(L.inPoint, rangeStart);\n';
+  script += '  var e = Math.min(L.outPoint, rangeEnd);\n';
+  script += '  if (e - s <= eps) { continue; }\n';
+  script += '  var vis = [[s, e]];\n';
+  script += '  var op = null;\n';
+  script += '  try { op = L.property("ADBE Transform Group").property("ADBE Opacity"); } catch (eOp) { op = null; }\n';
+  script += '  if (checkOpacity && op !== null) {\n';
+  script += '    if (op.numKeys === 0) {\n';
+  script += '      if (op.value <= opThr) {\n';
+  script += '        skipped.push({ index: li, name: L.name, reason: "static opacity 0" });\n';
+  script += '        continue;\n';
+  script += '      }\n';
+  script += '    } else {\n';
+  script += '      vis = __visSpans(op, s, e, opThr);\n';
+  script += '      if (checkFades) {\n';
+  script += '        var lastKeyT = op.keyTime(op.numKeys);\n';
+  script += '        if (lastKeyT > L.outPoint + eps && L.outPoint <= rangeEnd + eps) {\n';
+  script += '          var opAtOut = op.valueAtTime(L.outPoint - eps, false);\n';
+  script += '          if (opAtOut > opThr) {\n';
+  script += '            issues.push({ type: "hard-cut", layer: L.name, layerIndex: li, start: __rt(L.outPoint), end: __rt(lastKeyT), opacityAtOut: Math.round(opAtOut), detail: "fade-out keys continue past outPoint: the layer is cut while still at " + Math.round(opAtOut) + "% opacity" });\n';
+  script += '          }\n';
+  script += '        }\n';
+  script += '        if (vis.length === 0) {\n';
+  script += '          issues.push({ type: "invisible", layer: L.name, layerIndex: li, start: __rt(s), end: __rt(e), duration: __rt(e - s), detail: "layer never exceeds " + opThr + "% opacity during its trimmed span" });\n';
+  script += '        } else {\n';
+  script += '          if (vis[0][0] - s > minGap) {\n';
+  script += '            issues.push({ type: "invisible-head", layer: L.name, layerIndex: li, start: __rt(s), end: __rt(vis[0][0]), duration: __rt(vis[0][0] - s), detail: "opacity stays under " + opThr + "% long after inPoint" });\n';
+  script += '          }\n';
+  script += '          var lastVisEnd = vis[vis.length - 1][1];\n';
+  script += '          if (e - lastVisEnd > minGap) {\n';
+  script += '            issues.push({ type: "invisible-tail", layer: L.name, layerIndex: li, start: __rt(lastVisEnd), end: __rt(e), duration: __rt(e - lastVisEnd), detail: "opacity reaches 0 before outPoint: invisible hold" });\n';
+  script += '          }\n';
+  script += '        }\n';
+  script += '      }\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  if (vis.length > 0) {\n';
+  script += '    entries.push({ name: L.name, index: li, vis: vis });\n';
+  script += '  }\n';
+  script += '}\n';
+
+  // Gaps: merge all visible spans, report uncovered stretches with neighbours
+  script += 'if (checkGaps) {\n';
+  script += '  var all = [];\n';
+  script += '  for (var iE = 0; iE < entries.length; iE++) {\n';
+  script += '    for (var iS = 0; iS < entries[iE].vis.length; iS++) { all.push(entries[iE].vis[iS]); }\n';
+  script += '  }\n';
+  script += '  all.sort(function (a, b) { return a[0] - b[0]; });\n';
+  script += '  var merged = [];\n';
+  script += '  for (var iM = 0; iM < all.length; iM++) {\n';
+  script += '    if (merged.length > 0 && all[iM][0] <= merged[merged.length - 1][1] + eps) {\n';
+  script += '      if (all[iM][1] > merged[merged.length - 1][1]) { merged[merged.length - 1][1] = all[iM][1]; }\n';
+  script += '    } else {\n';
+  script += '      merged.push([all[iM][0], all[iM][1]]);\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  var cursor = rangeStart;\n';
+  script += '  var gapList = [];\n';
+  script += '  for (var iG = 0; iG < merged.length; iG++) {\n';
+  script += '    if (merged[iG][0] - cursor > minGap) { gapList.push([cursor, merged[iG][0]]); }\n';
+  script += '    if (merged[iG][1] > cursor) { cursor = merged[iG][1]; }\n';
+  script += '  }\n';
+  script += '  if (rangeEnd - cursor > minGap) { gapList.push([cursor, rangeEnd]); }\n';
+  script += '  for (var iG2 = 0; iG2 < gapList.length; iG2++) {\n';
+  script += '    var g = gapList[iG2];\n';
+  script += '    var before = []; var after = [];\n';
+  script += '    for (var iN = 0; iN < entries.length; iN++) {\n';
+  script += '      var vv = entries[iN].vis;\n';
+  script += '      for (var iV = 0; iV < vv.length; iV++) {\n';
+  script += '        if (Math.abs(vv[iV][1] - g[0]) <= frameDur) { before.push(entries[iN].name); break; }\n';
+  script += '      }\n';
+  script += '      for (var iV2 = 0; iV2 < vv.length; iV2++) {\n';
+  script += '        if (Math.abs(vv[iV2][0] - g[1]) <= frameDur) { after.push(entries[iN].name); break; }\n';
+  script += '      }\n';
+  script += '    }\n';
+  script += '    issues.push({ type: "gap", start: __rt(g[0]), end: __rt(g[1]), duration: __rt(g[1] - g[0]), endsBefore: before, startsAfter: after, detail: "nothing visible" });\n';
+  script += '  }\n';
+  script += '}\n';
+
+  // Overlaps: sweep over span edges; segments where 2+ layers are visible
+  script += 'if (checkOverlaps) {\n';
+  script += '  var ev = [];\n';
+  script += '  for (var iE2 = 0; iE2 < entries.length; iE2++) {\n';
+  script += '    var vv2 = entries[iE2].vis;\n';
+  script += '    for (var iS2 = 0; iS2 < vv2.length; iS2++) {\n';
+  script += '      ev.push({ t: vv2[iS2][0], d: 1, n: entries[iE2].name });\n';
+  script += '      ev.push({ t: vv2[iS2][1], d: -1, n: entries[iE2].name });\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  ev.sort(function (a, b) { var dt = a.t - b.t; if (dt !== 0) { return dt; } return a.d - b.d; });\n';
+  script += '  var active = {}; var count = 0; var prevT = null;\n';
+  script += '  for (var iEv = 0; iEv < ev.length; iEv++) {\n';
+  script += '    var t = ev[iEv].t;\n';
+  script += '    if (prevT !== null && count >= 2 && t - prevT > minOverlap) {\n';
+  script += '      var names = [];\n';
+  script += '      for (var nm in active) { if (active[nm] > 0) { names.push(nm); } }\n';
+  script += '      issues.push({ type: "overlap", start: __rt(prevT), end: __rt(t), duration: __rt(t - prevT), layers: names });\n';
+  script += '    }\n';
+  script += '    if (ev[iEv].d === 1) { active[ev[iEv].n] = (active[ev[iEv].n] || 0) + 1; count++; }\n';
+  script += '    else { active[ev[iEv].n] = (active[ev[iEv].n] || 0) - 1; count--; }\n';
+  script += '    prevT = t;\n';
+  script += '  }\n';
+  script += '}\n';
+
+  script += 'issues.sort(function (a, b) { return a.start - b.start; });\n';
+  script += 'var result = {\n';
+  script += '  comp: comp.name,\n';
+  script += '  rangeStart: __rt(rangeStart),\n';
+  script += '  rangeEnd: __rt(rangeEnd),\n';
+  script += '  frameRate: comp.frameRate,\n';
+  script += '  layersConsidered: entries.length,\n';
+  script += '  layersSkipped: skipped,\n';
+  script += '  issueCount: issues.length,\n';
+  script += '  issues: issues\n';
+  script += '};\n';
+  script += 'result;\n';
 
   return script;
 }
