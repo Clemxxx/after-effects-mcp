@@ -651,6 +651,36 @@ const TOOLS = [
     generator: generators.generateLintTimeline
   },
   {
+    name: 'lint_layer_bounds',
+    description: 'Audit a composition for layers that go OUTSIDE the canvas (or a safe-area margin) at any moment, in one read-only call — typically text that is too wide/tall for the frame, a tracking or scale animation that pushes glyphs past the edges, or a text element sitting off-canvas after a font/content change. Text layers only by default (layerTypes to add shape/precomp/av/solid, or \'all\'). Bounds follow anchor point, scale, rotation, parenting and text animators; static layers are measured once, animated layers are sampled at every keyframe time plus a regular grid over their visible span (opacity-aware). Each issue reports the worst moment (time, px overflow per side, comp-space bounds, fitScale = factor that would make it fit), the overflow spans and a kind: constant (always outside — a real layout bug), entrance/exit (only while sliding in/out — usually intentional), transient or mixed. Use ignoreHead/ignoreTail or ignoreOffScreen to discount entrance/exit animations, margin for a title-safe area.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        rangeStart: { type: 'number', description: 'Audit start in seconds (default 0)' },
+        rangeEnd: { type: 'number', description: 'Audit end in seconds (default comp duration)' },
+        layerTypes: { type: 'array', items: { type: 'string', enum: ['text', 'shape', 'precomp', 'av', 'solid', 'all'] }, description: 'Layer types to check (default [\'text\']). Backgrounds/solids usually exceed the canvas on purpose, so add them deliberately.' },
+        includeLayers: { type: 'array', items: {}, description: 'Only check these layers (names or 1-based indices)' },
+        excludeLayers: { type: 'array', items: {}, description: 'Layer names (strings) or indices (numbers) to ignore' },
+        margin: { type: 'number', description: 'Safe-area margin in px on all sides (default 0 = canvas edge). E.g. 54 for a 5% title-safe zone on 1080px.' },
+        marginX: { type: 'number', description: 'Horizontal margin in px, overrides margin for left/right' },
+        marginY: { type: 'number', description: 'Vertical margin in px, overrides margin for top/bottom' },
+        tolerance: { type: 'number', description: 'Overflow under this many px is ignored (default 0.5)' },
+        sampleInterval: { type: 'number', description: 'Sampling step in seconds for animated layers (default 0.2). Keyframe times are always sampled too.' },
+        maxSamplesPerLayer: { type: 'number', description: 'Cap on samples per animated layer; the step grows to fit (default 200)' },
+        maxTotalSamples: { type: 'number', description: 'Budget for the whole call (default 4000, ~15s). When exceeded the sampling step is raised automatically (sampleIntervalRaised: true in the result) — narrow with rangeStart/rangeEnd or includeLayers for a finer pass.' },
+        ignoreHead: { type: 'number', description: 'Skip the first N seconds of each layer (entrance animations)' },
+        ignoreTail: { type: 'number', description: 'Skip the last N seconds of each layer (exit animations)' },
+        ignoreOffScreen: { type: 'boolean', description: 'Do not count moments where the layer is ENTIRELY outside the canvas (slide-in/out from off-screen). Default false.' },
+        minOverflowDuration: { type: 'number', description: 'Only report overflow spans at least this long, in seconds (default 0)' },
+        opacityThreshold: { type: 'number', description: 'Opacity percentage under which a moment is not checked (default 1)' },
+        checkOpacity: { type: 'boolean', description: 'Skip moments where the layer is transparent (default true)' }
+      }
+    },
+    generator: generators.generateLintLayerBounds
+  },
+  {
     name: 'get_layer_info',
     description: 'Get detailed information about a layer, including transform values, text properties for text layers (font, size, fill/stroke colors, justification, content), and color for solid layers',
     inputSchema: {

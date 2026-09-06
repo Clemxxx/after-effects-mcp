@@ -51,6 +51,7 @@ export {
   generateSetTextContent,
   generateListLayers,
   generateLintTimeline,
+  generateLintLayerBounds,
   generateGetLayerInfo
 } from './generators/layerGenerators.js';
 

@@ -2241,7 +2241,427 @@ export function generateLintTimeline(params: {
   script += '  rangeEnd: __rt(rangeEnd),\n';
   script += '  frameRate: comp.frameRate,\n';
   script += '  layersConsidered: entries.length,\n';
+  script += '  layersOutOfRange: outOfRange,\n';
   script += '  layersSkipped: skipped,\n';
+  script += '  issueCount: issues.length,\n';
+  script += '  issues: issues\n';
+  script += '};\n';
+  script += 'result;\n';
+
+  return script;
+}
+
+/**
+ * ES3 helpers for lint_layer_bounds: layer typing, dynamic detection and
+ * keyframe-time collection over a property tree (layer + parent chain).
+ */
+const LINT_BOUNDS_HELPERS =
+  'function __rt(t) { return Math.round(t * 1000) / 1000; }\n' +
+  'function __rp(v) { return Math.round(v * 10) / 10; }\n' +
+  'function __ltype(L) {\n' +
+  '  if (L instanceof TextLayer) return "text";\n' +
+  '  if (L instanceof ShapeLayer) return "shape";\n' +
+  '  if (L.source instanceof CompItem) return "precomp";\n' +
+  '  if (L.source && L.source.mainSource instanceof SolidSource) return "solid";\n' +
+  '  if (L.source) return "av";\n' +
+  '  return "unknown";\n' +
+  '}\n' +
+  // Property groups / properties that never change a layer's sourceRect,
+  // so their keyframes do not force time sampling (effects, masks, opacity,
+  // colour-only text animators...).
+  'var __SKIP_GROUPS = { "ADBE Effect Parade": true, "ADBE Mask Parade": true, "ADBE Marker": true, "ADBE Audio Group": true, "ADBE Layer Styles": true, "ADBE Material Options Group": true, "ADBE Extrsn Options Group": true };\n' +
+  'var __SKIP_PROPS = { "ADBE Opacity": true, "ADBE Text Opacity": true, "ADBE Text Fill Color": true, "ADBE Text Fill Hue": true, "ADBE Text Fill Saturation": true, "ADBE Text Fill Brightness": true, "ADBE Text Fill Opacity": true, "ADBE Text Stroke Color": true, "ADBE Text Stroke Hue": true, "ADBE Text Stroke Saturation": true, "ADBE Text Stroke Brightness": true, "ADBE Text Stroke Opacity": true, "ADBE Text Blur": true };\n' +
+  'function __relevantGroup(group) {\n' +
+  '  if (__SKIP_GROUPS[group.matchName] === true) return false;\n' +
+  '  if (group.matchName === "ADBE Text Animator") {\n' +
+  '    try {\n' +
+  '      var ap = group.property("ADBE Text Animator Properties");\n' +
+  '      for (var j = 1; j <= ap.numProperties; j++) {\n' +
+  '        if (__SKIP_PROPS[ap.property(j).matchName] !== true) return true;\n' +
+  '      }\n' +
+  '      return false;\n' +
+  '    } catch (eA) { return true; }\n' +
+  '  }\n' +
+  '  return true;\n' +
+  '}\n' +
+  // True when a bounds-relevant property in the group has keyframes or a live expression
+  'function __dynGroup(group) {\n' +
+  '  if (!__relevantGroup(group)) return false;\n' +
+  '  for (var i = 1; i <= group.numProperties; i++) {\n' +
+  '    var p = group.property(i);\n' +
+  '    if (p.propertyType === PropertyType.PROPERTY) {\n' +
+  '      if (__SKIP_PROPS[p.matchName] === true) continue;\n' +
+  '      if (p.numKeys > 0) return true;\n' +
+  '      try { if (p.expressionEnabled && p.expression !== "") return true; } catch (eX) {}\n' +
+  '    } else if (__dynGroup(p)) {\n' +
+  '      return true;\n' +
+  '    }\n' +
+  '  }\n' +
+  '  return false;\n' +
+  '}\n' +
+  'function __isDynamic(L) {\n' +
+  '  var cur = L;\n' +
+  '  while (cur) {\n' +
+  '    if (__dynGroup(cur)) return true;\n' +
+  '    cur = cur.parent;\n' +
+  '  }\n' +
+  '  return false;\n' +
+  '}\n' +
+  'function __keyTimes(group, s, e, out) {\n' +
+  '  if (!__relevantGroup(group)) return;\n' +
+  '  for (var i = 1; i <= group.numProperties; i++) {\n' +
+  '    if (out.length >= 2000) return;\n' +
+  '    var p = group.property(i);\n' +
+  '    if (p.propertyType === PropertyType.PROPERTY) {\n' +
+  '      if (__SKIP_PROPS[p.matchName] === true) continue;\n' +
+  '      for (var k = 1; k <= p.numKeys; k++) {\n' +
+  '        var kt = p.keyTime(k);\n' +
+  '        if (kt >= s && kt <= e) out.push(kt);\n' +
+  '      }\n' +
+  '    } else {\n' +
+  '      __keyTimes(p, s, e, out);\n' +
+  '    }\n' +
+  '  }\n' +
+  '}\n' +
+  'function __sortDedupe(arr, tolT) {\n' +
+  '  arr.sort(function (a, b) { return a - b; });\n' +
+  '  var out = [];\n' +
+  '  for (var i = 0; i < arr.length; i++) {\n' +
+  '    if (out.length === 0 || arr[i] - out[out.length - 1] > tolT) out.push(arr[i]);\n' +
+  '  }\n' +
+  '  return out;\n' +
+  '}\n' +
+  'function __textInfo(L, t) {\n' +
+  '  var info = {};\n' +
+  '  try {\n' +
+  '    var stp = L.property("ADBE Text Properties");\n' +
+  '    var docProp = stp.property("ADBE Text Document");\n' +
+  '    var doc = null;\n' +
+  '    try { doc = docProp.valueAtTime(t, false); } catch (eV) { doc = docProp.value; }\n' +
+  '    var txt = String(doc.text);\n' +
+  '    info.lines = txt.split(/[\\r\\n]/).length;\n' +
+  '    txt = txt.replace(/[\\r\\n]+/g, " / ");\n' +
+  '    info.text = txt.length > 80 ? txt.substring(0, 77) + "..." : txt;\n' +
+  '    try { info.fontSize = doc.fontSize; } catch (e1) {}\n' +
+  '    try { info.tracking = doc.tracking; } catch (e2) {}\n' +
+  '    try {\n' +
+  '      info.isBoxText = doc.boxText;\n' +
+  '      if (doc.boxText) info.boxSize = [doc.boxTextSize[0], doc.boxTextSize[1]];\n' +
+  '    } catch (e3) {}\n' +
+  '    var anims = [];\n' +
+  '    try {\n' +
+  '      var ag = stp.property("ADBE Text Animators");\n' +
+  '      for (var ai = 1; ai <= ag.numProperties; ai++) {\n' +
+  '        var an = ag.property(ai);\n' +
+  '        anims.push({ name: an.name, animated: __dynGroup(an) });\n' +
+  '      }\n' +
+  '    } catch (e4) {}\n' +
+  '    info.animators = anims;\n' +
+  '  } catch (eT) {}\n' +
+  '  return info;\n' +
+  '}\n';
+
+/**
+ * Generate script to audit layer bounds against the composition canvas over
+ * time. Reports every layer (text layers by default) whose comp-space
+ * bounding box crosses the canvas edge — or a safe-area margin — at any
+ * sampled moment while the layer is visible. Bounds come from
+ * sourceRectAtTime (text animators included) pushed through anchor point,
+ * scale, Z rotation and the parent chain (2D math; camera ignored).
+ * Static layers are measured once; animated ones are sampled at every
+ * keyframe time of the layer + parents plus a regular grid.
+ */
+export function generateLintLayerBounds(params: {
+  compId?: number;
+  compName?: string;
+  rangeStart?: number;
+  rangeEnd?: number;
+  layerTypes?: string[];
+  includeLayers?: (string | number)[];
+  excludeLayers?: (string | number)[];
+  margin?: number;
+  marginX?: number;
+  marginY?: number;
+  tolerance?: number;
+  sampleInterval?: number;
+  maxSamplesPerLayer?: number;
+  maxTotalSamples?: number;
+  ignoreHead?: number;
+  ignoreTail?: number;
+  minOverflowDuration?: number;
+  ignoreOffScreen?: boolean;
+  opacityThreshold?: number;
+  checkOpacity?: boolean;
+}): string {
+  const margin = params.margin !== undefined ? params.margin : 0;
+  const marginX = params.marginX !== undefined ? params.marginX : margin;
+  const marginY = params.marginY !== undefined ? params.marginY : margin;
+  const types = (params.layerTypes && params.layerTypes.length > 0) ? params.layerTypes : ['text'];
+  const allTypes = types.indexOf('all') !== -1;
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+
+  script += 'var W = comp.width; var H = comp.height;\n';
+  script += 'var frameDur = comp.frameDuration;\n';
+  script += 'var eps = frameDur / 2;\n';
+  script += 'var rangeStart = ' + (params.rangeStart !== undefined ? params.rangeStart : 0) + ';\n';
+  script += 'var rangeEnd = ' + (params.rangeEnd !== undefined ? params.rangeEnd : 'comp.duration') + ';\n';
+  script += 'var mL = ' + marginX + ', mR = ' + marginX + ', mT = ' + marginY + ', mB = ' + marginY + ';\n';
+  script += 'var tol = ' + (params.tolerance !== undefined ? params.tolerance : 0.5) + ';\n';
+  script += 'var interval = ' + (params.sampleInterval !== undefined ? params.sampleInterval : 0.2) + ';\n';
+  script += 'var maxSamples = ' + (params.maxSamplesPerLayer !== undefined ? Math.max(2, params.maxSamplesPerLayer) : 200) + ';\n';
+  script += 'var maxTotal = ' + (params.maxTotalSamples !== undefined ? Math.max(100, params.maxTotalSamples) : 4000) + ';\n';
+  script += 'var ignoreHead = ' + (params.ignoreHead || 0) + ';\n';
+  script += 'var ignoreTail = ' + (params.ignoreTail || 0) + ';\n';
+  script += 'var minDur = ' + (params.minOverflowDuration || 0) + ';\n';
+  script += 'var ignoreOffScreen = ' + (params.ignoreOffScreen === true) + ';\n';
+  script += 'var opThr = ' + (params.opacityThreshold !== undefined ? params.opacityThreshold : 1) + ';\n';
+  script += 'var checkOpacity = ' + (params.checkOpacity !== false) + ';\n';
+  script += 'if (interval < frameDur) interval = frameDur;\n';
+
+  script += 'var __types = {};\n';
+  for (const t of types) {
+    script += '__types["' + escapeString(String(t)) + '"] = true;\n';
+  }
+  script += 'var __allTypes = ' + allTypes + ';\n';
+
+  script += 'var __useInclude = ' + (!!(params.includeLayers && params.includeLayers.length > 0)) + ';\n';
+  script += 'var __inName = {}; var __inIdx = {};\n';
+  for (const inc of params.includeLayers || []) {
+    if (typeof inc === 'number') {
+      script += '__inIdx[' + inc + '] = true;\n';
+    } else {
+      script += '__inName["' + escapeString(inc) + '"] = true;\n';
+    }
+  }
+  script += 'var __exName = {}; var __exIdx = {};\n';
+  for (const ex of params.excludeLayers || []) {
+    if (typeof ex === 'number') {
+      script += '__exIdx[' + ex + '] = true;\n';
+    } else {
+      script += '__exName["' + escapeString(ex) + '"] = true;\n';
+    }
+  }
+
+  // The geometry helpers read the global `alignTime`; it is reassigned
+  // before every sample so the same code measures the layer at any time.
+  script += 'var alignTime = 0;\n';
+  script += emitGeometryHelpers('lint_layer_bounds');
+  script += LINT_BOUNDS_HELPERS;
+
+  script += 'var __t0 = new Date().getTime();\n';
+  script += 'var skipped = [];\n';
+  script += 'var issues = [];\n';
+  script += 'var layersChecked = 0;\n';
+  script += 'var samplesTaken = 0;\n';
+  script += 'var outOfRange = 0;\n';
+  script += 'var plan = [];\n';
+  script += 'var gridTotal = 0;\n';
+  // Pass 1: select layers, detect animation, collect keyframe times
+  script += 'for (var li = 1; li <= comp.numLayers; li++) {\n';
+  script += '  var L = comp.layer(li);\n';
+  script += '  var reason = null;\n';
+  script += '  if (__exName[L.name] === true || __exIdx[li] === true) { reason = "excluded"; }\n';
+  script += '  else if (__useInclude && !(__inName[L.name] === true || __inIdx[li] === true)) { reason = "not in includeLayers"; }\n';
+  script += '  else if (L instanceof CameraLayer) { reason = "camera"; }\n';
+  script += '  else if (L instanceof LightLayer) { reason = "light"; }\n';
+  script += '  else if (!L.enabled) { reason = "disabled"; }\n';
+  script += '  else if (L.guideLayer) { reason = "guide"; }\n';
+  script += '  else if (L.nullLayer) { reason = "null"; }\n';
+  script += '  else if (L.adjustmentLayer) { reason = "adjustment"; }\n';
+  script += '  else if (!L.hasVideo) { reason = "audio"; }\n';
+  script += '  var ltype = reason === null ? __ltype(L) : "unknown";\n';
+  script += '  if (reason === null && !__allTypes && __types[ltype] !== true) { reason = "type " + ltype + " not selected"; }\n';
+  script += '  if (reason !== null) {\n';
+  script += '    if (reason !== "not in includeLayers" && reason.indexOf("type ") !== 0) { skipped.push({ index: li, name: L.name, reason: reason }); }\n';
+  script += '    continue;\n';
+  script += '  }\n';
+  script += '  var s = Math.max(L.inPoint, rangeStart) + ignoreHead;\n';
+  script += '  var e = Math.min(L.outPoint, rangeEnd) - ignoreTail;\n';
+  script += '  if (e - s <= eps) { outOfRange++; continue; }\n';
+  script += '  var op = null;\n';
+  script += '  try { op = L.property("ADBE Transform Group").property("ADBE Opacity"); } catch (eOp) { op = null; }\n';
+  script += '  if (checkOpacity && op !== null && op.numKeys === 0 && op.value <= opThr) {\n';
+  script += '    skipped.push({ index: li, name: L.name, reason: "static opacity 0" });\n';
+  script += '    continue;\n';
+  script += '  }\n';
+  script += '  var dynamic = __isDynamic(L);\n';
+  script += '  var times = [];\n';
+  script += '  var kt = [];\n';
+  script += '  if (!dynamic) {\n';
+  script += '    var cands = [(s + e) / 2, s + eps, e - eps, s + (e - s) / 4, s + 3 * (e - s) / 4];\n';
+  script += '    for (var ci = 0; ci < cands.length; ci++) {\n';
+  script += '      if (!checkOpacity || op === null || op.numKeys === 0 || op.valueAtTime(cands[ci], false) > opThr) { times = [cands[ci]]; break; }\n';
+  script += '    }\n';
+  script += '    if (times.length === 0) { skipped.push({ index: li, name: L.name, reason: "never visible" }); continue; }\n';
+  script += '  } else {\n';
+  script += '    var cur = L;\n';
+  script += '    while (cur) { __keyTimes(cur, s, e, kt); cur = cur.parent; }\n';
+  script += '    kt = __sortDedupe(kt, eps);\n';
+  script += '    var keyCap = Math.floor(maxSamples / 2);\n';
+  script += '    if (kt.length > keyCap) {\n';
+  script += '      var sub = [];\n';
+  script += '      for (var ki = 0; ki < keyCap; ki++) { sub.push(kt[Math.floor(ki * kt.length / keyCap)]); }\n';
+  script += '      kt = sub;\n';
+  script += '    }\n';
+  script += '    gridTotal += Math.min(Math.max(2, maxSamples - kt.length), (e - s) / interval + 1);\n';
+  script += '  }\n';
+  script += '  plan.push({ L: L, li: li, ltype: ltype, s: s, e: e, op: op, dynamic: dynamic, kt: kt, times: times });\n';
+  script += '}\n';
+
+  // Global budget: stretch the grid step so the whole audit stays within
+  // the command timeout on long comps with many animated layers.
+  script += 'var intervalRaised = false;\n';
+  script += 'if (gridTotal > maxTotal) { interval = interval * gridTotal / maxTotal; intervalRaised = true; }\n';
+
+  // Pass 2: sample every planned layer
+  script += 'for (var pi = 0; pi < plan.length; pi++) {\n';
+  script += '  var it = plan[pi];\n';
+  script += '  var L = it.L; var li = it.li; var ltype = it.ltype; var s = it.s; var e = it.e; var op = it.op; var dynamic = it.dynamic;\n';
+  script += '  var times = it.times;\n';
+  script += '  var step = e - s;\n';
+  script += '  if (dynamic) {\n';
+  script += '    var kt = it.kt;\n';
+  script += '    var gridN = Math.max(2, maxSamples - kt.length);\n';
+  script += '    step = Math.max(interval, (e - s) / (gridN - 1));\n';
+  script += '    for (var gt = s; gt < e - eps; gt += step) { kt.push(gt); }\n';
+  script += '    kt.push(e - eps);\n';
+  script += '    times = __sortDedupe(kt, eps / 2);\n';
+  script += '  }\n';
+  script += '  var samp = [];\n';
+  script += '  var spans = [];\n';
+  script += '  var curSpan = null;\n';
+  script += '  var measureError = null;\n';
+  script += '  for (var ti = 0; ti < times.length; ti++) {\n';
+  script += '    var t = times[ti];\n';
+  script += '    var over = false;\n';
+  script += '    var visible = true;\n';
+  script += '    if (checkOpacity && op !== null && op.numKeys > 0 && op.valueAtTime(t, false) <= opThr) { visible = false; }\n';
+  script += '    if (visible) {\n';
+  script += '      samplesTaken++;\n';
+  script += '      alignTime = t;\n';
+  script += '      var b = null;\n';
+  script += '      try { b = __bounds(L); } catch (eB) { measureError = eB.toString(); break; }\n';
+  script += '      var ovL = mL - b.minX;\n';
+  script += '      var ovR = b.maxX - (W - mR);\n';
+  script += '      var ovT = mT - b.minY;\n';
+  script += '      var ovB = b.maxY - (H - mB);\n';
+  script += '      var off = (b.maxX <= mL) || (b.minX >= W - mR) || (b.maxY <= mT) || (b.minY >= H - mB);\n';
+  script += '      var amount = Math.max(ovL, ovR, ovT, ovB);\n';
+  script += '      over = amount > tol && !(off && ignoreOffScreen);\n';
+  script += '      if (over) {\n';
+  script += '        samp.push({ t: t, amount: amount, l: ovL, r: ovR, tp: ovT, bt: ovB, b: b, off: off });\n';
+  script += '      }\n';
+  script += '    }\n';
+  script += '    if (over) {\n';
+  script += '      if (curSpan === null) { curSpan = { from: samp.length - 1, to: samp.length - 1 }; }\n';
+  script += '      else { curSpan.to = samp.length - 1; }\n';
+  script += '    } else if (curSpan !== null) {\n';
+  script += '      spans.push(curSpan); curSpan = null;\n';
+  script += '    }\n';
+  script += '  }\n';
+  script += '  if (curSpan !== null) { spans.push(curSpan); }\n';
+  script += '  if (measureError !== null) {\n';
+  script += '    skipped.push({ index: li, name: L.name, reason: "cannot measure bounds: " + measureError });\n';
+  script += '    continue;\n';
+  script += '  }\n';
+  script += '  layersChecked++;\n';
+  script += '  if (spans.length === 0) { continue; }\n';
+
+  // Build the report for this layer: spans in seconds, worst sample, kind
+  script += '  var total = e - s;\n';
+  script += '  var outSpans = [];\n';
+  script += '  var worst = null;\n';
+  script += '  var sideMax = { left: null, right: null, top: null, bottom: null };\n';
+  script += '  var overflowDur = 0;\n';
+  script += '  var touchHead = false, touchTail = false, touchMid = false;\n';
+  script += '  for (var si = 0; si < spans.length; si++) {\n';
+  script += '    var sp = spans[si];\n';
+  script += '    var spStart = dynamic ? samp[sp.from].t : s;\n';
+  script += '    var spEnd = dynamic ? samp[sp.to].t : e;\n';
+  script += '    if (dynamic && sp.to > sp.from) { spEnd = Math.min(e, spEnd + step / 2); spStart = Math.max(s, spStart - step / 2); }\n';
+  script += '    var spDur = spEnd - spStart;\n';
+  script += '    if (spDur < minDur - eps) { continue; }\n';
+  script += '    var spMax = 0; var spSides = {}; var allOff = true;\n';
+  script += '    for (var qi = sp.from; qi <= sp.to; qi++) {\n';
+  script += '      var q = samp[qi];\n';
+  script += '      if (!q.off) allOff = false;\n';
+  script += '      if (q.amount > spMax) spMax = q.amount;\n';
+  script += '      if (q.l > tol) { spSides.left = true; if (sideMax.left === null || q.l > sideMax.left.px) sideMax.left = { px: __rp(q.l), time: __rt(q.t) }; }\n';
+  script += '      if (q.r > tol) { spSides.right = true; if (sideMax.right === null || q.r > sideMax.right.px) sideMax.right = { px: __rp(q.r), time: __rt(q.t) }; }\n';
+  script += '      if (q.tp > tol) { spSides.top = true; if (sideMax.top === null || q.tp > sideMax.top.px) sideMax.top = { px: __rp(q.tp), time: __rt(q.t) }; }\n';
+  script += '      if (q.bt > tol) { spSides.bottom = true; if (sideMax.bottom === null || q.bt > sideMax.bottom.px) sideMax.bottom = { px: __rp(q.bt), time: __rt(q.t) }; }\n';
+  script += '      if (worst === null || q.amount > worst.amount) { worst = q; }\n';
+  script += '    }\n';
+  script += '    var sidesArr = [];\n';
+  script += '    for (var sn in spSides) { if (spSides[sn] === true) sidesArr.push(sn); }\n';
+  script += '    var hd = spStart <= s + step + eps; var tl = spEnd >= e - step - eps;\n';
+  script += '    if (hd) touchHead = true;\n';
+  script += '    if (tl) touchTail = true;\n';
+  script += '    if (!hd && !tl) touchMid = true;\n';
+  script += '    overflowDur += spDur;\n';
+  script += '    outSpans.push({ start: __rt(spStart), end: __rt(spEnd), duration: __rt(spDur), maxOverflow: __rp(spMax), sides: sidesArr, offScreen: allOff });\n';
+  script += '  }\n';
+  script += '  if (outSpans.length === 0) { continue; }\n';
+  script += '  var kind;\n';
+  script += '  if (!dynamic || (outSpans.length === 1 && touchHead && touchTail && overflowDur >= total * 0.9)) { kind = "constant"; }\n';
+  script += '  else if (touchHead && touchTail && !touchMid) { kind = "entrance-exit"; }\n';
+  script += '  else if (touchHead && !touchTail && !touchMid) { kind = "entrance"; }\n';
+  script += '  else if (touchTail && !touchHead && !touchMid) { kind = "exit"; }\n';
+  script += '  else if (touchMid && !touchHead && !touchTail) { kind = "transient"; }\n';
+  script += '  else { kind = "mixed"; }\n';
+  script += '  var wb = worst.b;\n';
+  script += '  var bw = wb.maxX - wb.minX; var bh = wb.maxY - wb.minY;\n';
+  script += '  var fitScale = 1;\n';
+  script += '  if (bw > 0) fitScale = Math.min(fitScale, (W - mL - mR) / bw);\n';
+  script += '  if (bh > 0) fitScale = Math.min(fitScale, (H - mT - mB) / bh);\n';
+  script += '  var sideTxt = [];\n';
+  script += '  if (sideMax.left !== null) sideTxt.push(sideMax.left.px + "px left");\n';
+  script += '  if (sideMax.right !== null) sideTxt.push(sideMax.right.px + "px right");\n';
+  script += '  if (sideMax.top !== null) sideTxt.push(sideMax.top.px + "px top");\n';
+  script += '  if (sideMax.bottom !== null) sideTxt.push(sideMax.bottom.px + "px bottom");\n';
+  script += '  var issue = {\n';
+  script += '    type: "overflow",\n';
+  script += '    layer: L.name,\n';
+  script += '    layerIndex: li,\n';
+  script += '    layerType: ltype,\n';
+  script += '    kind: kind,\n';
+  script += '    visibleStart: __rt(s),\n';
+  script += '    visibleEnd: __rt(e),\n';
+  script += '    overflowDuration: __rt(overflowDur),\n';
+  script += '    worst: {\n';
+  script += '      time: __rt(worst.t),\n';
+  script += '      amount: __rp(worst.amount),\n';
+  script += '      overflow: { left: __rp(Math.max(0, worst.l)), right: __rp(Math.max(0, worst.r)), top: __rp(Math.max(0, worst.tp)), bottom: __rp(Math.max(0, worst.bt)) },\n';
+  script += '      bounds: { left: __rp(wb.minX), top: __rp(wb.minY), right: __rp(wb.maxX), bottom: __rp(wb.maxY), width: __rp(bw), height: __rp(bh) },\n';
+  script += '      fitScale: Math.round(fitScale * 1000) / 1000\n';
+  script += '    },\n';
+  script += '    maxOverflowBySide: sideMax,\n';
+  script += '    spans: outSpans,\n';
+  script += '    detail: "exceeds the " + (mL || mR || mT || mB ? "safe area" : "canvas") + " by up to " + sideTxt.join(", ") + " (" + kind + ", " + __rt(overflowDur) + "s of " + __rt(total) + "s visible)"\n';
+  script += '  };\n';
+  script += '  if (L.threeDLayer) { issue.approximate = true; issue.note = "3D layer: bounds computed in 2D, camera and X/Y rotation ignored"; }\n';
+  script += '  if (ltype === "text") { issue.text = __textInfo(L, worst.t); }\n';
+  script += '  issues.push(issue);\n';
+  script += '}\n';
+
+  script += 'issues.sort(function (a, b) { return a.visibleStart - b.visibleStart; });\n';
+  script += 'var result = {\n';
+  script += '  comp: comp.name,\n';
+  script += '  width: W,\n';
+  script += '  height: H,\n';
+  script += '  frameRate: comp.frameRate,\n';
+  script += '  rangeStart: __rt(rangeStart),\n';
+  script += '  rangeEnd: __rt(rangeEnd),\n';
+  script += '  margins: { left: mL, top: mT, right: mR, bottom: mB },\n';
+  script += '  sampleInterval: Math.round(interval * 1000) / 1000,\n';
+  script += '  sampleIntervalRaised: intervalRaised,\n';
+  script += '  layersChecked: layersChecked,\n';
+  script += '  layersSkipped: skipped,\n';
+  script += '  samplesTaken: samplesTaken,\n';
+  script += '  elapsedMs: new Date().getTime() - __t0,\n';
   script += '  issueCount: issues.length,\n';
   script += '  issues: issues\n';
   script += '};\n';
