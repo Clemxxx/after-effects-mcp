@@ -57,6 +57,7 @@ export {
   generateListLayers,
   generateLintTimeline,
   generateLintLayerBounds,
+  generateGetLayerBounds,
   generateGetLayerInfo
 } from './generators/layerGenerators.js';
 

@@ -119,7 +119,7 @@ The Claude Code skill provides specialized knowledge about After Effects workflo
 `create_project` · `open_project` · `save_project` · `close_project` · `get_project_info` · `import_footage` · `create_composition` · `modify_composition` · `duplicate_composition` · `delete_composition` · `list_compositions` · `get_composition_info` · `get_composition_frame` · `get_render_queue` · `render_composition`
 
 ### Layer Creation
-`add_solid_layer` · `add_text_layer` · `add_text_layer_advanced` · `add_shape_layer` · `add_null_layer` · `add_adjustment_layer` · `add_camera_layer` · `add_light_layer` · `add_av_layer` · `precompose_layers` · `modify_layer` · `delete_layer` · `copy_layers` · `reorder_layer` · `get_text_styles` · `set_text_style_range` · `set_text_content` · `lint_timeline` · `lint_layer_bounds`
+`add_solid_layer` · `add_text_layer` · `add_text_layer_advanced` · `add_shape_layer` · `add_null_layer` · `add_adjustment_layer` · `add_camera_layer` · `add_light_layer` · `add_av_layer` · `precompose_layers` · `modify_layer` · `delete_layer` · `copy_layers` · `reorder_layer` · `get_text_styles` · `set_text_style_range` · `set_text_content` · `lint_timeline` · `lint_layer_bounds` · `get_layer_bounds`
 
 ### Animation & Keyframing
 `set_keyframe` · `set_keyframe_advanced` · `apply_easy_ease` · `set_temporal_ease` · `offset_keyframes` · `scale_keyframe_timing` · `reverse_keyframes` · `copy_keyframes` · `get_keyframes`

@@ -1220,6 +1220,7 @@ export function generateAlignLayers(params: {
   mode?: string;
   padding?: number;
   time?: number;
+  area?: { left?: number; top?: number; right?: number; bottom?: number };
 }): string {
   const horizontal = params.horizontal;
   const vertical = params.vertical;
@@ -1290,21 +1291,29 @@ export function generateAlignLayers(params: {
 
   // The comp-space delta that aligns a bounding box to the canvas.
   script += 'var __pad = ' + padding + ';\n';
+  // Region to align within: the canvas by default, or an explicit area
+  // (e.g. the space between a header and a footer).
+  const area = params.area || {};
+  script += 'var __aL = ' + (area.left !== undefined ? area.left : 0) + ';\n';
+  script += 'var __aT = ' + (area.top !== undefined ? area.top : 0) + ';\n';
+  script += 'var __aR = ' + (area.right !== undefined ? area.right : 'comp.width') + ';\n';
+  script += 'var __aB = ' + (area.bottom !== undefined ? area.bottom : 'comp.height') + ';\n';
+  script += 'if (__aR <= __aL || __aB <= __aT) { throw new Error("align_layers: area must have right > left and bottom > top"); }\n';
   script += 'var __deltaFor = function (b) {\n';
   script += '  var dx = 0, dy = 0;\n';
   if (horizontal === 'left') {
-    script += '  dx = __pad - b.minX;\n';
+    script += '  dx = __aL + __pad - b.minX;\n';
   } else if (horizontal === 'center') {
-    script += '  dx = (comp.width - (b.maxX - b.minX)) / 2 - b.minX;\n';
+    script += '  dx = __aL + ((__aR - __aL) - (b.maxX - b.minX)) / 2 - b.minX;\n';
   } else if (horizontal === 'right') {
-    script += '  dx = comp.width - __pad - b.maxX;\n';
+    script += '  dx = __aR - __pad - b.maxX;\n';
   }
   if (vertical === 'top') {
-    script += '  dy = __pad - b.minY;\n';
+    script += '  dy = __aT + __pad - b.minY;\n';
   } else if (vertical === 'middle') {
-    script += '  dy = (comp.height - (b.maxY - b.minY)) / 2 - b.minY;\n';
+    script += '  dy = __aT + ((__aB - __aT) - (b.maxY - b.minY)) / 2 - b.minY;\n';
   } else if (vertical === 'bottom') {
-    script += '  dy = comp.height - __pad - b.maxY;\n';
+    script += '  dy = __aB - __pad - b.maxY;\n';
   }
   script += '  return [dx, dy];\n';
   script += '};\n';
@@ -1390,6 +1399,7 @@ export function generateDistributeGroups(params: {
   axis: string;
   spacing?: number;
   anchor?: string;
+  area?: { left?: number; top?: number; right?: number; bottom?: number };
   order?: string;
   time?: number;
 }): string {
@@ -1512,7 +1522,13 @@ export function generateDistributeGroups(params: {
     script += 'for (var ts = 0; ts < order.length; ts++) { totalSize += sizes[order[ts]]; }\n';
     script += 'var span = totalSize + __gap * (order.length - 1);\n';
     if (anchor === 'center') {
-      script += 'var cursor = (' + axisLen + ' - span) / 2;\n';
+      const area = params.area || {};
+      const aMin = axis === 'horizontal' ? area.left : area.top;
+      const aMax = axis === 'horizontal' ? area.right : area.bottom;
+      script += 'var __aMin = ' + (aMin !== undefined ? aMin : 0) + ';\n';
+      script += 'var __aMax = ' + (aMax !== undefined ? aMax : axisLen) + ';\n';
+      script += 'if (__aMax <= __aMin) { throw new Error("distribute_groups: area must have right > left and bottom > top"); }\n';
+      script += 'var cursor = __aMin + ((__aMax - __aMin) - span) / 2;\n';
     } else {
       script += 'var cursor = mins[order[0]];\n';
     }
@@ -2667,6 +2683,140 @@ export function generateLintLayerBounds(params: {
   script += '};\n';
   script += 'result;\n';
 
+  return script;
+}
+
+/**
+ * Generate script to MEASURE layers: real comp-space bounding boxes
+ * (sourceRectAtTime through anchor/scale/rotation/parents), centers,
+ * consecutive gaps along one axis and free space to the canvas edges.
+ * Read-only companion of align_layers / distribute_groups.
+ */
+export function generateGetLayerBounds(params: {
+  compId?: number;
+  compName?: string;
+  layerNames?: string[];
+  layerIndices?: number[];
+  excludeLayers?: (string | number)[];
+  time?: number;
+  axis?: 'vertical' | 'horizontal';
+  includeFullFrame?: boolean;
+}): string {
+  const axis = params.axis || 'vertical';
+  const minProp = axis === 'horizontal' ? 'minX' : 'minY';
+  const maxProp = axis === 'horizontal' ? 'maxX' : 'maxY';
+  const axisLen = axis === 'horizontal' ? 'comp.width' : 'comp.height';
+  const explicit = !!((params.layerNames && params.layerNames.length > 0) || (params.layerIndices && params.layerIndices.length > 0));
+
+  let script = '';
+  script += generateProjectCheck();
+  script += generateCompAccess(params.compId, params.compName);
+  script += 'var alignTime = ' + (params.time !== undefined ? params.time : 'comp.time') + ';\n';
+  script += 'var includeFullFrame = ' + (params.includeFullFrame === true) + ';\n';
+  script += emitGeometryHelpers('get_layer_bounds');
+  script += 'function __rp(v) { return Math.round(v * 10) / 10; }\n';
+  script += 'function __rt(t) { return Math.round(t * 1000) / 1000; }\n';
+
+  script += 'var __exName = {}; var __exIdx = {};\n';
+  for (const ex of params.excludeLayers || []) {
+    if (typeof ex === 'number') {
+      script += '__exIdx[' + ex + '] = true;\n';
+    } else {
+      script += '__exName["' + escapeString(ex) + '"] = true;\n';
+    }
+  }
+
+  script += 'var targets = [];\n';
+  script += 'var notFound = [];\n';
+  if (explicit) {
+    if (params.layerIndices && params.layerIndices.length > 0) {
+      script += 'var idxs = ' + arrayToES3(params.layerIndices) + ';\n';
+      script += 'for (var ii = 0; ii < idxs.length; ii++) {\n';
+      script += '  if (idxs[ii] >= 1 && idxs[ii] <= comp.numLayers) { targets.push(comp.layer(idxs[ii])); } else { notFound.push("index " + idxs[ii]); }\n';
+      script += '}\n';
+    }
+    if (params.layerNames && params.layerNames.length > 0) {
+      script += 'var names = ' + arrayToES3(params.layerNames) + ';\n';
+      script += 'for (var ni = 0; ni < names.length; ni++) {\n';
+      script += '  var found = null;\n';
+      script += '  for (var li = 1; li <= comp.numLayers; li++) { if (comp.layer(li).name === names[ni]) { found = comp.layer(li); break; } }\n';
+      script += '  if (found) { targets.push(found); } else { notFound.push(names[ni]); }\n';
+      script += '}\n';
+    }
+  } else {
+    // Every content layer visible at alignTime
+    script += 'for (var li = 1; li <= comp.numLayers; li++) {\n';
+    script += '  var L0 = comp.layer(li);\n';
+    script += '  if (__exName[L0.name] === true || __exIdx[li] === true) continue;\n';
+    script += '  if (L0 instanceof CameraLayer || L0 instanceof LightLayer) continue;\n';
+    script += '  if (!L0.enabled || !L0.hasVideo || L0.nullLayer || L0.adjustmentLayer || L0.guideLayer) continue;\n';
+    script += '  if (L0.inPoint > alignTime || L0.outPoint <= alignTime) continue;\n';
+    script += '  try { if (L0.property("ADBE Transform Group").property("ADBE Opacity").valueAtTime(alignTime, false) <= 0) continue; } catch (eO) {}\n';
+    script += '  targets.push(L0);\n';
+    script += '}\n';
+  }
+
+  script += 'var rows = [];\n';
+  script += 'var fullFrame = [];\n';
+  script += 'var errors = [];\n';
+  script += 'for (var ti = 0; ti < targets.length; ti++) {\n';
+  script += '  var L = targets[ti];\n';
+  script += '  if (L instanceof CameraLayer || L instanceof LightLayer) { errors.push({ layer: L.name, error: "camera/light layers have no bounds" }); continue; }\n';
+  script += '  var b = null;\n';
+  script += '  try { alignTime = ' + (params.time !== undefined ? params.time : 'comp.time') + '; b = __bounds(L); } catch (eB) { errors.push({ layer: L.name, error: eB.toString() }); continue; }\n';
+  script += '  var covers = b.minX <= 0.5 && b.minY <= 0.5 && b.maxX >= comp.width - 0.5 && b.maxY >= comp.height - 0.5;\n';
+  script += '  if (covers && !includeFullFrame && ' + !explicit + ') { fullFrame.push(L.name); continue; }\n';
+  // Is the layer moving/changing right now? Compare with bounds a bit before/after.
+  script += '  var t0 = alignTime;\n';
+  script += '  var moving = false;\n';
+  script += '  try {\n';
+  script += '    var tA = Math.max(L.inPoint, t0 - 0.25); var tB = Math.min(L.outPoint - comp.frameDuration, t0 + 0.25);\n';
+  script += '    alignTime = tA; var bA = __bounds(L);\n';
+  script += '    alignTime = tB; var bB = __bounds(L);\n';
+  script += '    var tolM = 0.5;\n';
+  script += '    moving = Math.abs(bA.minX - b.minX) > tolM || Math.abs(bA.maxX - b.maxX) > tolM || Math.abs(bA.minY - b.minY) > tolM || Math.abs(bA.maxY - b.maxY) > tolM || Math.abs(bB.minX - b.minX) > tolM || Math.abs(bB.maxX - b.maxX) > tolM || Math.abs(bB.minY - b.minY) > tolM || Math.abs(bB.maxY - b.maxY) > tolM;\n';
+  script += '  } catch (eM) {}\n';
+  script += '  alignTime = t0;\n';
+  script += '  var ltype = "unknown";\n';
+  script += '  if (L instanceof TextLayer) { ltype = "text"; }\n';
+  script += '  else if (L instanceof ShapeLayer) { ltype = "shape"; }\n';
+  script += '  else if (L.source instanceof CompItem) { ltype = "precomp"; }\n';
+  script += '  else if (L.source && L.source.mainSource instanceof SolidSource) { ltype = "solid"; }\n';
+  script += '  else if (L.source) { ltype = "av"; }\n';
+  script += '  var row = {\n';
+  script += '    index: L.index, name: L.name, type: ltype, parent: L.parent ? L.parent.name : null,\n';
+  script += '    inPoint: __rt(L.inPoint), outPoint: __rt(L.outPoint),\n';
+  script += '    bounds: { left: __rp(b.minX), top: __rp(b.minY), right: __rp(b.maxX), bottom: __rp(b.maxY), width: __rp(b.maxX - b.minX), height: __rp(b.maxY - b.minY) },\n';
+  script += '    center: { x: __rp((b.minX + b.maxX) / 2), y: __rp((b.minY + b.maxY) / 2) },\n';
+  script += '    offsetFromCanvasCenter: { x: __rp((b.minX + b.maxX) / 2 - comp.width / 2), y: __rp((b.minY + b.maxY) / 2 - comp.height / 2) },\n';
+  script += '    animatingAtTime: moving,\n';
+  script += '    _min: b.' + minProp + ', _max: b.' + maxProp + ', _b: b\n';
+  script += '  };\n';
+  script += '  if (ltype === "text") { try { var td = L.property("ADBE Text Properties").property("ADBE Text Document").value; var tx = String(td.text).replace(/[\\r\\n]+/g, " / "); row.text = tx.length > 60 ? tx.substring(0, 57) + "..." : tx; } catch (eT) {} }\n';
+  script += '  if (ltype === "precomp") { row.note = "bounds = the precomp frame, not its visible pixels (unless collapse transformations is on)"; }\n';
+  script += '  rows.push(row);\n';
+  script += '}\n';
+
+  script += 'rows.sort(function (a, b) { return a._min - b._min; });\n';
+  script += 'var gaps = [];\n';
+  script += 'for (var gi = 0; gi < rows.length - 1; gi++) {\n';
+  script += '  gaps.push({ from: rows[gi].name, to: rows[gi + 1].name, gap: __rp(rows[gi + 1]._min - rows[gi]._max) });\n';
+  script += '}\n';
+  script += 'var union = null;\n';
+  script += 'for (var ui = 0; ui < rows.length; ui++) { union = __unionBounds(union, { minX: rows[ui]._b.minX, minY: rows[ui]._b.minY, maxX: rows[ui]._b.maxX, maxY: rows[ui]._b.maxY }); }\n';
+  script += 'var result = { comp: comp.name, width: comp.width, height: comp.height, time: __rt(alignTime), axis: "' + axis + '", layers: [], gaps: gaps };\n';
+  script += 'for (var ri = 0; ri < rows.length; ri++) {\n';
+  script += '  var r = rows[ri]; delete r._min; delete r._max; delete r._b; result.layers.push(r);\n';
+  script += '}\n';
+  script += 'if (union !== null) {\n';
+  script += '  result.union = { left: __rp(union.minX), top: __rp(union.minY), right: __rp(union.maxX), bottom: __rp(union.maxY), width: __rp(union.maxX - union.minX), height: __rp(union.maxY - union.minY), center: { x: __rp((union.minX + union.maxX) / 2), y: __rp((union.minY + union.maxY) / 2) } };\n';
+  script += '  result.freeSpace = { before: __rp(union.' + minProp + '), after: __rp(' + axisLen + ' - union.' + maxProp + ') };\n';
+  script += '  result.unionOffsetFromCanvasCenter = { x: __rp((union.minX + union.maxX) / 2 - comp.width / 2), y: __rp((union.minY + union.maxY) / 2 - comp.height / 2) };\n';
+  script += '}\n';
+  script += 'if (fullFrame.length > 0) { result.fullFrameLayersIgnored = fullFrame; }\n';
+  script += 'if (notFound.length > 0) { result.notFound = notFound; }\n';
+  script += 'if (errors.length > 0) { result.errors = errors; }\n';
+  script += 'result;\n';
   return script;
 }
 

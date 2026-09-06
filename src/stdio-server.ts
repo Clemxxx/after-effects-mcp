@@ -522,7 +522,7 @@ const TOOLS = [
   },
   {
     name: 'align_layers',
-    description: 'Align/center one or several layers on the composition canvas (horizontal: left/center/right, vertical: top/middle/bottom). By default several layers are treated as ONE group: their combined bounding box is aligned and every layer moves by the same delta, preserving the relative layout between them. Bounds account for anchor point, scale, rotation and parenting; animated positions are shifted keyframe by keyframe.',
+    description: 'Align/center one or several layers on the composition canvas (horizontal: left/center/right, vertical: top/middle/bottom). By default several layers are treated as ONE group: their combined bounding box is aligned and every layer moves by the same delta, preserving the relative layout between them. Pass area: { top, bottom, left, right } to align within a region (e.g. between a header and a footer) instead of the whole canvas. Bounds account for anchor point, scale, rotation and parenting; animated positions are shifted keyframe by keyframe.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -533,7 +533,8 @@ const TOOLS = [
         horizontal: { type: 'string', enum: ['left', 'center', 'right'], description: 'Horizontal alignment on the canvas' },
         vertical: { type: 'string', enum: ['top', 'middle', 'bottom'], description: 'Vertical alignment on the canvas' },
         mode: { type: 'string', enum: ['group', 'individual'], description: 'group (default): move all layers by one shared delta, keeping their relative layout. individual: align each layer separately' },
-        padding: { type: 'number', description: 'Margin in pixels kept from the canvas edge for left/right/top/bottom alignments (default 0)' },
+        padding: { type: 'number', description: 'Margin in pixels kept from the canvas (or area) edge for left/right/top/bottom alignments (default 0)' },
+        area: { type: 'object', properties: { left: { type: 'number' }, top: { type: 'number' }, right: { type: 'number' }, bottom: { type: 'number' } }, description: 'Region (px, comp space) to align within instead of the whole canvas — e.g. { top: 180, bottom: 1800 } to center vertically between a header and a footer. Missing sides default to the canvas edges.' },
         time: { type: 'number', description: 'Time in seconds at which bounds are measured (default: current comp time). Matters for animated/text layers' }
       }
     },
@@ -560,6 +561,7 @@ const TOOLS = [
         },
         axis: { type: 'string', enum: ['horizontal', 'vertical'], description: 'Axis along which the groups are distributed' },
         spacing: { type: 'number', description: 'Fixed gap in pixels between consecutive group boxes. Omit for even distribution (first/last groups stay, middle gaps equalize)' },
+        area: { type: 'object', properties: { left: { type: 'number' }, top: { type: 'number' }, right: { type: 'number' }, bottom: { type: 'number' } }, description: 'Region (px, comp space) to center the arrangement in instead of the whole canvas — e.g. { top: 180, bottom: 1800 } to center vertically between a header and a footer. Missing sides default to the canvas edges.' },
         anchor: { type: 'string', enum: ['center', 'first'], description: 'With spacing: center (default) centers the whole arrangement on the canvas; first keeps the first group in place and stacks the others after it' },
         order: { type: 'string', enum: ['position', 'given'], description: 'position (default): keep the groups\' current on-canvas order. given: use the order of the groups array (reorders them visually)' },
         time: { type: 'number', description: 'Time in seconds at which bounds are measured (default: current comp time)' }
@@ -687,6 +689,24 @@ const TOOLS = [
       }
     },
     generator: generators.generateLintTimeline
+  },
+  {
+    name: 'get_layer_bounds',
+    description: 'MEASURE layers before/after laying them out: the REAL comp-space bounding box of each layer at a given time (sourceRectAtTime — text glyph extents, animators included — through anchor point, scale, rotation and parents), its center and offset from the canvas center, whether it is still animating at that time, plus the GAPS between consecutive layers along one axis (negative = overlap), the union box and the free space left to the canvas edges. Read-only. With no layer list, every content layer visible at the time is measured (full-frame layers like BG/header precomps are ignored). Use it to diagnose "not centered" / uneven spacing by numbers instead of by eye, then fix with align_layers / distribute_groups and measure again. Note: a precomp layer reports its frame, not its visible pixels.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string' },
+        layerNames: { type: 'array', items: { type: 'string' }, description: 'Layers to measure (by name). Omit both lists to measure everything visible at time.' },
+        layerIndices: { type: 'array', items: { type: 'number' }, description: 'Layers to measure (1-based index)' },
+        excludeLayers: { type: 'array', items: {}, description: 'Layer names or indices to skip in auto mode' },
+        time: { type: 'number', description: 'Time in seconds at which bounds are measured (default: current comp time). Pick a moment where the content is fully in place (animatingAtTime tells you if it is not).' },
+        axis: { type: 'string', enum: ['vertical', 'horizontal'], description: 'Axis along which layers are sorted and gaps computed (default vertical = top to bottom)' },
+        includeFullFrame: { type: 'boolean', description: 'Also list layers covering the whole canvas (default false)' }
+      }
+    },
+    generator: generators.generateGetLayerBounds
   },
   {
     name: 'lint_layer_bounds',
