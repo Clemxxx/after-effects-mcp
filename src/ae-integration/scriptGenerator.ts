@@ -27,6 +27,11 @@ export {
   generateSetActiveComposition
 } from './generators/compositionGenerators.js';
 
+export {
+  generateGetRenderQueue,
+  generateRenderComposition
+} from './generators/renderGenerators.js';
+
 // Layer generators
 export {
   generateAddSolidLayer,

@@ -100,7 +100,7 @@ export class FileCommunicator {
   /**
    * Execute a script in After Effects and return the result
    */
-  async executeScript(script: string): Promise<MCPResponse> {
+  async executeScript(script: string, timeoutMs?: number): Promise<MCPResponse> {
     if (!this.isConnected) {
       await this.connect();
     }
@@ -119,17 +119,18 @@ export class FileCommunicator {
 
     return new Promise<MCPResponse>((resolve, reject) => {
       // Set up timeout
+      const effectiveTimeout = timeoutMs && timeoutMs > 0 ? timeoutMs : this.commandTimeout;
       const timeout = setTimeout(() => {
         this.pendingCommands.delete(commandId);
         this.cleanupCommandFile(commandPath);
 
         this.logger.error('Command timeout', { commandId });
         reject(new Error(
-          `Command timeout after ${this.commandTimeout}ms. ` +
+          `Command timeout after ${effectiveTimeout}ms. ` +
           'Make sure After Effects is running and the CEP extension is loaded. ' +
           'The extension panel should be visible in Window > Extensions > AE-MCP.'
         ));
-      }, this.commandTimeout);
+      }, effectiveTimeout);
 
       // Store pending command
       this.pendingCommands.set(commandId, {

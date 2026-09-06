@@ -203,6 +203,44 @@ const TOOLS = [
     generator: generators.generateGetCompositionInfo
   },
   {
+    name: 'get_render_queue',
+    description: 'Inspect the After Effects render queue and list the available export presets: Render Settings templates (Best Settings, Draft Settings, custom ones...) and Output Module templates — the quality/format presets such as "H.264 - Match Render Settings - 15 Mbps", "Lossless", "Apple ProRes 422 HQ" or user-saved ones. Call it before render_composition to pick exact template names, and afterwards to check an item status (QUEUED, RENDERING, DONE, ERR_STOPPED...) and its output path.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        includeTemplates: { type: 'boolean', description: 'List Render Settings and Output Module templates (default true)' }
+      }
+    },
+    generator: generators.generateGetRenderQueue
+  },
+  {
+    name: 'render_composition',
+    description: 'Export a composition to a file through the render queue: choose WHERE it goes (outputPath: a folder — the file is named after the comp with the preset extension — or a full file path) and WHICH quality preset is used (outputModuleTemplate = an Output Module template name from get_render_queue, e.g. "H.264 - Match Render Settings - 15 Mbps" or "Apple ProRes 422 HQ"; renderSettingsTemplate = "Best Settings" / "Draft Settings"...). Time span: whole comp (default), the work area, or a custom startTime/endTime. mode "render" (default) renders inside After Effects and BLOCKS until finished — the call waits up to timeoutSeconds (default 600) and returns status, elapsed time and file size; AE and this server are unavailable meanwhile. mode "queue" only adds the item for a manual render; mode "ame" hands it to Adobe Media Encoder (non-blocking, best for long H.264 exports). Other queued items are disabled during the export (renderOnlyThisItem) and restored afterwards. Existing files are overwritten by default. Save the project first if you care about the render queue state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        compId: { type: 'number' },
+        compName: { type: 'string', description: 'Composition name (defaults to the active composition)' },
+        outputPath: { type: 'string', description: 'Destination: an existing/new folder (file named <comp>.<ext>) or a full file path. Extension is added from the preset when missing. Default: the project folder.' },
+        outputModuleTemplate: { type: 'string', description: 'Output Module template = format & quality preset, exact name from get_render_queue (e.g. "H.264 - Match Render Settings - 15 Mbps", "Lossless", "Apple ProRes 422 HQ"). Default: the AE default output module.' },
+        renderSettingsTemplate: { type: 'string', description: 'Render Settings template, exact name from get_render_queue (e.g. "Best Settings", "Draft Settings", "Multi-Machine Settings"). Default: the AE default render settings.' },
+        timeSpan: { type: 'string', enum: ['comp', 'workArea', 'custom'], description: 'Which part to render (default comp; custom = startTime/endTime)' },
+        startTime: { type: 'number', description: 'Custom span start in seconds' },
+        endTime: { type: 'number', description: 'Custom span end in seconds' },
+        mode: { type: 'string', enum: ['render', 'queue', 'ame'], description: 'render = render now in AE (blocking); queue = add to the queue only; ame = send to Adobe Media Encoder (non-blocking). Default render.' },
+        renderOnlyThisItem: { type: 'boolean', description: 'Temporarily disable other queued items so only this export runs (default true)' },
+        overwrite: { type: 'boolean', description: 'Delete an existing output file first (default true)' },
+        timeoutSeconds: { type: 'number', description: 'How long to wait for a mode "render" export before giving up (default 600, max 3600). The render keeps going in AE if the wait expires — poll get_render_queue.' }
+      }
+    },
+    generator: generators.generateRenderComposition,
+    timeoutMs: (args: Record<string, any>) => {
+      if (args.mode === 'queue' || args.mode === 'ame') return undefined;
+      const secs = typeof args.timeoutSeconds === 'number' ? Math.min(3600, Math.max(10, args.timeoutSeconds)) : 600;
+      return secs * 1000 + 5000;
+    }
+  },
+  {
     name: 'get_composition_frame',
     description: 'Render a single frame of a composition and return it as an image, so you can see the current visual state of your work. Defaults to the active composition at its current playhead time.',
     inputSchema: {
@@ -1685,8 +1723,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Generate the script
     const script = tool.generator(args as any || {});
 
-    // Execute in After Effects
-    const result = await communicator.executeScript(script);
+    // Execute in After Effects (some tools, e.g. renders, need a longer wait)
+    const timeoutFn = (tool as any).timeoutMs as ((a: Record<string, any>) => number | undefined) | undefined;
+    const timeoutMs = timeoutFn ? timeoutFn((args as any) || {}) : undefined;
+    const result = await communicator.executeScript(script, timeoutMs);
 
     return {
       content: [
