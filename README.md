@@ -8,6 +8,7 @@
 <h1 align="center">AE-MCP</h1>
 <p align="center"><strong>After Effects Model Context Protocol Server</strong></p>
 <p align="center">Automate Adobe After Effects with AI through 70+ MCP tools</p>
+<p align="center"><sub>Based on <a href="https://github.com/ishu86/after-effects-mcp">ishu86/after-effects-mcp</a> by Ishant Kohar</sub></p>
 
 ---
 
@@ -41,8 +42,8 @@ AE-MCP is a comprehensive MCP server that enables AI assistants like Claude to d
 ### Step 1: Install the MCP Server
 
 ```bash
-git clone https://github.com/anthropics/ae-mcp.git
-cd ae-mcp
+git clone https://github.com/Clemxxx/after-effects-mcp.git
+cd after-effects-mcp
 npm install
 npm run build
 ```
@@ -299,9 +300,24 @@ AI Assistant (Claude)
 
 Contributions are welcome! Please read our contributing guidelines before submitting PRs.
 
+## Credits
+
+This project is based on **[after-effects-mcp](https://github.com/ishu86/after-effects-mcp)** by
+[Ishant Kohar](https://github.com/ishu86), which provides the MCP server, the CEP panel and the
+file-based bridge to the After Effects DOM. All credit for that foundation goes to the original author.
+
+This version keeps that architecture and adds:
+
+- **Layout tools** — `align_layers`, `distribute_groups`, `get_layer_bounds`, with an optional area mode
+- **Group control** — `create_group_controller` to drive a set of layers from a single null
+- **Linting** — `lint_timeline` and `lint_layer_bounds` to catch gaps, overlaps and off-canvas text
+- **Rendering** — `render_composition` and `get_render_queue`
+- **Text styling** — per-range `baselineShift` / `leading`, plus batch execution helpers
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). The original work is MIT-licensed by Ishant Kohar; this project keeps
+the same license.
 
 ---
 
